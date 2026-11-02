@@ -13,7 +13,7 @@ from clinical_trials_search.settings import (
 class SettingsTests(unittest.TestCase):
     def test_installed_package_cannot_write_into_a_checkout(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             repo = root / "checkout"
             (repo / "src/clinical_trials_search").mkdir(parents=True)
             (repo / "pyproject.toml").touch()
@@ -28,7 +28,7 @@ class SettingsTests(unittest.TestCase):
 
     def test_relative_config_paths_and_environment_precedence(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             config = root / "local.json"
             save_settings(config, {"output_root": "output", "r_library": "r-library"})
             with patch.dict("os.environ", {}, clear=True):

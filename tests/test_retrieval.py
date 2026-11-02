@@ -41,7 +41,7 @@ class NativeRetrieval(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.destination = Path(self.temp.name) / "attempt"
+        self.destination = Path(self.temp.name).resolve() / "attempt"
 
     def retrieve(self, pages, queries=None):
         values = [VERSION, *pages, VERSION]
@@ -318,7 +318,7 @@ class CtrdataAdapter(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.destination = Path(self.temp.name) / "attempt"
+        self.destination = Path(self.temp.name).resolve() / "attempt"
 
     def fake_bridge(self, command, **kwargs):
         destination = Path(command[-1])
