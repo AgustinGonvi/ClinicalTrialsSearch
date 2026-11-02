@@ -94,8 +94,10 @@ def renal_category(term: str | None, organ_system: str | None) -> str | None:
         return None
     if re.search(r"creatinine|blood urea|glomerular filtration", text):
         return "kidney_laboratory"
+    # Pyelonephritis follows the SOC-based infection rule below. Other nephritis
+    # terms (including glomerulonephritis) retain the diagnosis classification.
     if re.search(
-        r"hepatorenal|nephritis|nephropathy|nephrotic|acute kidney|chronic kidney|renal failure|renal impairment|renal infarct",
+        r"hepatorenal|(?<!pyelo)nephritis|nephropathy|nephrotic|acute kidney|chronic kidney|renal failure|renal impairment|renal infarct",
         text,
     ):
         return "kidney_diagnosis"
@@ -301,7 +303,11 @@ def analyze(
             raise ValueError(f"A nonempty review reason is required for {nct}")
     include_ids = set(selection.get("include_ids", []))
     exclude_ids = set(selection.get("exclude_ids", []))
-    discovered = {nct for ids in query_ids.values() for nct in ids}
+    query_names_by_id = {}
+    for query_name, ids in query_ids.items():
+        for nct in ids:
+            query_names_by_id.setdefault(nct, set()).add(query_name)
+    discovered = set(query_names_by_id)
     decisions, trials, events, warnings = [], [], [], []
     expected = profile.get("expected", {})
     expected_aliases = list(dict.fromkeys(expected.get("aliases", [])))
@@ -360,9 +366,7 @@ def analyze(
             "reason": reason,
             "reviewed_by_human": reviewed,
             "discovered": nct in discovered,
-            "query_names": _json(
-                sorted(name for name, ids in query_ids.items() if nct in ids)
-            ),
+            "query_names": _json(sorted(query_names_by_id.get(nct, ()))),
             "matched_aliases": _json(hits),
             "matched_excluded_aliases": _json(excluded_hits),
             "matched_phrases": _json(phrases),

@@ -16,3 +16,9 @@ A live run of `profiles/kidney-small.json` through each backend returned the sam
 The R adapter also checked its SQLite JSON export against the original registry pages. Raw source records and local paths are kept outside this repository; the reproducible bounded profile is included.
 
 These results establish equivalence for this small cohort and source version. They do not establish comprehensive kidney-trial coverage, clinical validity of the renal heuristic, successful recovery from a real upstream outage, or live multi-page equivalence. Pagination and automatic fallback were exercised with controlled failures in the offline suite. GitHub Actions runs that suite and the publication scan on Windows and Linux with Python 3.11, 3.12, and 3.13.
+
+## Follow-up correctness review
+
+On 2026-11-02, the expanded suite passed 78 Python tests after corrections to pyelonephritis classification, malformed R-output validation, SSL read retries, and ID lookup performance. The optional R regression passed under C, French, German, and Spanish locales, including restoration after a parsing error. The original code reproduced both the pyelonephritis misclassification and the `running` attempt manifest after a missing bridge field.
+
+Repeating the same bounded live comparison produced identical source records and six evidence exports across both backends. Compared with the initial snapshot, four pyelonephritis rows changed from `kidney_diagnosis` to `urinary_infection`; their counts, arms, seriousness and source locations were unchanged. Both runs still contained 1,380 AE rows and 100 renal/urinary rows. The registry version and source records were unchanged, and both manifests correctly flagged the changed software fingerprint against the original baseline.

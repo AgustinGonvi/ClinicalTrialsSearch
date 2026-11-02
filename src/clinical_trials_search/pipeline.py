@@ -310,7 +310,6 @@ def run_search(
         for nct, record in sorted(bundle.records.items()):
             write_json(staging / "records" / f"{nct}.json", record)
         write_json(staging / "query_ids.json", bundle.query_ids)
-        write_json(staging / "evidence.json", analysis)
         for key, fields in (
             ("decisions", ("NCTId", "selection", "reason", "reviewed_by_human")),
             (

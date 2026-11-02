@@ -8,6 +8,16 @@ fail <- function(message, retryable = FALSE) {
                  class = c("retrieval_error", "error", "condition")))
 }
 
+parse_retry_after_date <- function(value) {
+  previous_locale <- Sys.getlocale("LC_TIME")
+  on.exit(Sys.setlocale("LC_TIME", previous_locale), add = TRUE)
+  locale <- suppressWarnings(Sys.setlocale("LC_TIME", "C"))
+  if (!nzchar(locale)) fail("Cannot set the HTTP-date locale for Retry-After")
+  when <- as.POSIXct(value, format = "%a, %d %b %Y %H:%M:%S", tz = "UTC")
+  if (is.na(when)) fail("Cannot honor registry Retry-After; retry later without switching backends")
+  when
+}
+
 main <- function() {
   for (package in c("ctrdata", "jsonlite", "nodbi", "DBI", "RSQLite", "httr2")) {
     if (!requireNamespace(package, quietly = TRUE)) fail(paste("Missing R package:", package), TRUE)
@@ -53,8 +63,7 @@ main <- function() {
       delay <- suppressWarnings(as.numeric(retry_after))
       if (length(delay) != 1L || is.na(delay)) {
         if (length(retry_after) == 1L && nzchar(retry_after)) {
-          when <- as.POSIXct(retry_after, format = "%a, %d %b %Y %H:%M:%S", tz = "UTC")
-          if (is.na(when)) fail("Cannot honor registry Retry-After; retry later without switching backends")
+          when <- parse_retry_after_date(retry_after)
           delay <- as.numeric(difftime(when, Sys.time(), units = "secs"))
         } else {
           delay <- 2^attempt

@@ -4,6 +4,7 @@ import datetime as dt
 import http.client
 import io
 import json
+import ssl
 import subprocess
 import tempfile
 import unittest
@@ -30,6 +31,15 @@ def study(nct="NCT00000001", title="Example study"):
 
 def response(value):
     return io.BytesIO(json.dumps(value).encode())
+
+
+class BrokenResponse(io.BytesIO):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    def read(self, *args, **kwargs):
+        raise self.error
 
 
 def save(path, value):
@@ -144,6 +154,15 @@ class NativeRetrieval(unittest.TestCase):
     def test_duplicate_within_query_is_rejected(self):
         with self.assertRaisesRegex(r.ValidationError, "within one paginated query"):
             self.retrieve([{"totalCount": 2, "studies": [study(), study()]}])
+
+    def test_duplicate_across_pages_of_one_query_is_rejected(self):
+        with self.assertRaisesRegex(r.ValidationError, "within one paginated query"):
+            self.retrieve(
+                [
+                    {"totalCount": 2, "studies": [study()], "nextPageToken": "two"},
+                    {"studies": [study()]},
+                ]
+            )
 
     def test_invalid_nct_and_boolean_count_are_rejected(self):
         for page in (
@@ -305,6 +324,88 @@ class NativeRetrieval(unittest.TestCase):
                         )
                 self.assertTrue(raised.exception.retryable)
 
+    def test_ssl_read_failure_can_retry_successfully(self):
+        values = [
+            BrokenResponse(ssl.SSLEOFError(8, "synthetic premature EOF")),
+            response(VERSION),
+            response({"totalCount": 0, "studies": []}),
+            response(VERSION),
+        ]
+        with (
+            patch.object(r.urllib.request, "urlopen", side_effect=values) as get,
+            patch.object(r.time, "sleep") as sleep,
+        ):
+            result = r.retrieve_native(QUERIES, self.destination, retries=1)
+        self.assertEqual(result.metadata["status"], "complete")
+        self.assertEqual(get.call_count, 4)
+        sleep.assert_called_once()
+        artifact = next(self.destination.rglob("failed_attempts/*.json"))
+        self.assertIn(
+            "synthetic premature EOF", json.loads(artifact.read_text())["error"]
+        )
+
+    def test_exhausted_ssl_read_failure_is_a_retryable_network_error(self):
+        values = [
+            BrokenResponse(ssl.SSLError(1, "synthetic SSL read failure"))
+            for _ in range(2)
+        ]
+        with (
+            patch.object(r.urllib.request, "urlopen", side_effect=values) as get,
+            patch.object(r.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(r.RetrievalError, "network failure") as raised:
+                r.retrieve_native(QUERIES, self.destination, retries=1)
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(len(list(self.destination.rglob("failed_attempts/*.json"))), 2)
+        self.assertEqual(
+            json.loads((self.destination / "retrieval_manifest.json").read_text())[
+                "status"
+            ],
+            "failed",
+        )
+
+    def test_certificate_verification_never_retries_or_allows_fallback(self):
+        errors = [
+            ssl.SSLCertVerificationError(1, "synthetic certificate failure"),
+            urllib.error.URLError(
+                ssl.SSLCertVerificationError(1, "synthetic certificate failure")
+            ),
+        ]
+        for index, error in enumerate(errors):
+            with (
+                self.subTest(error=type(error).__name__),
+                patch.object(r.urllib.request, "urlopen", side_effect=error) as get,
+                patch.object(r.time, "sleep") as sleep,
+            ):
+                with self.assertRaisesRegex(
+                    r.RetrievalError, "certificate verification"
+                ) as raised:
+                    r.retrieve_native(
+                        QUERIES,
+                        Path(self.temp.name) / f"certificate-{index}",
+                        retries=3,
+                    )
+                self.assertFalse(raised.exception.retryable)
+                self.assertEqual(get.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_disk_write_failure_never_retries_network(self):
+        with (
+            patch.object(
+                r.urllib.request, "urlopen", return_value=response(VERSION)
+            ) as get,
+            patch.object(
+                Path, "write_bytes", side_effect=OSError("synthetic full disk")
+            ),
+            patch.object(r.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(r.RetrievalError, "Local I/O") as raised:
+                r.retrieve_native(QUERIES, self.destination, retries=3)
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(get.call_count, 1)
+        sleep.assert_not_called()
+
     def test_existing_attempt_is_never_overwritten(self):
         self.destination.mkdir()
         marker = self.destination / "original.txt"
@@ -315,6 +416,24 @@ class NativeRetrieval(unittest.TestCase):
 
 
 class CtrdataAdapter(unittest.TestCase):
+    def test_unresolvable_bridge_path_records_failure(self):
+        resolve = Path.resolve
+
+        def invalid_artifact(path, *args, **kwargs):
+            if path.name == "count.json":
+                raise OSError("synthetic invalid artifact path")
+            return resolve(path, *args, **kwargs)
+
+        with (
+            patch.object(r.subprocess, "run", side_effect=self.fake_bridge),
+            patch.object(Path, "resolve", invalid_artifact),
+        ):
+            with self.assertRaisesRegex(r.ValidationError, "cannot resolve"):
+                r.retrieve_ctrdata(QUERIES, self.destination)
+        saved = json.loads((self.destination / "retrieval_manifest.json").read_text())
+        self.assertEqual(saved["status"], "failed")
+        self.assertFalse(saved["retryable"])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -385,6 +504,146 @@ class CtrdataAdapter(unittest.TestCase):
 
         with patch.object(r.subprocess, "run", side_effect=corrupt):
             with self.assertRaisesRegex(r.ValidationError, "altered registry source"):
+                r.retrieve_ctrdata(QUERIES, self.destination)
+
+    def test_malformed_bridge_output_marks_attempt_failed(self):
+        cases = [
+            ("manifest-array", "bridge_manifest.json", lambda value: []),
+            (
+                "query-array",
+                "bridge_manifest.json",
+                lambda value: dict(value, queries={}),
+            ),
+            (
+                "query-entry",
+                "bridge_manifest.json",
+                lambda value: dict(value, queries=[None]),
+            ),
+            (
+                "missing-count-file",
+                "bridge_manifest.json",
+                lambda value: dict(
+                    value,
+                    queries=[
+                        {
+                            k: v
+                            for k, v in value["queries"][0].items()
+                            if k != "count_file"
+                        }
+                    ],
+                ),
+            ),
+            (
+                "wrong-count-file",
+                "bridge_manifest.json",
+                lambda value: dict(
+                    value, queries=[dict(value["queries"][0], count_file=1)]
+                ),
+            ),
+            (
+                "raw-page-array",
+                "bridge_manifest.json",
+                lambda value: dict(
+                    value,
+                    queries=[
+                        dict(value["queries"][0], raw_pages="raw/condition/page.json")
+                    ],
+                ),
+            ),
+            (
+                "raw-page-entry",
+                "bridge_manifest.json",
+                lambda value: dict(
+                    value, queries=[dict(value["queries"][0], raw_pages=[{}])]
+                ),
+            ),
+            ("count-response", "raw/condition/count.json", lambda value: []),
+        ]
+        for name, relative, corrupt in cases:
+            with self.subTest(name=name):
+                self.destination = Path(self.temp.name).resolve() / name
+
+                def malformed(command, **kwargs):
+                    completed = self.fake_bridge(command, **kwargs)
+                    path = self.destination / relative
+                    save(path, corrupt(json.loads(path.read_text())))
+                    return completed
+
+                with patch.object(r.subprocess, "run", side_effect=malformed):
+                    with self.assertRaises(r.ValidationError) as raised:
+                        r.retrieve_ctrdata(QUERIES, self.destination)
+                self.assertFalse(raised.exception.retryable)
+                manifest = json.loads(
+                    (self.destination / "retrieval_manifest.json").read_text()
+                )
+                self.assertEqual(manifest["status"], "failed")
+                self.assertFalse(manifest["retryable"])
+                self.assertTrue((self.destination / "raw/condition/page.json").exists())
+
+    def test_malformed_bridge_error_does_not_enable_fallback(self):
+        for index, error in enumerate(
+            ([], {"message": "failure", "retryable": "false"})
+        ):
+            self.destination = Path(self.temp.name).resolve() / f"error-{index}"
+
+            def failed(command, **kwargs):
+                save(self.destination / "bridge_error.json", error)
+                return subprocess.CompletedProcess(command, 1)
+
+            with (
+                self.subTest(error=error),
+                patch.object(r.subprocess, "run", side_effect=failed),
+            ):
+                with self.assertRaises(r.ValidationError) as raised:
+                    r.retrieve_ctrdata(QUERIES, self.destination)
+                self.assertFalse(raised.exception.retryable)
+            self.assertEqual(
+                json.loads((self.destination / "retrieval_manifest.json").read_text())[
+                    "status"
+                ],
+                "failed",
+            )
+
+    def test_cross_query_ids_are_allowed_but_cross_page_duplicates_are_not(self):
+        queries = QUERIES + [{"name": "term", "params": {"query.term": "example"}}]
+
+        def overlap(command, **kwargs):
+            completed = self.fake_bridge(command, **kwargs)
+            path = self.destination / "bridge_manifest.json"
+            manifest = json.loads(path.read_text())
+            manifest["queries"].append(
+                dict(manifest["queries"][0], name="term", queryterm="term=example")
+            )
+            save(path, manifest)
+            return completed
+
+        with patch.object(r.subprocess, "run", side_effect=overlap):
+            result = r.retrieve_ctrdata(queries, self.destination)
+        self.assertEqual(
+            result.query_ids, {"condition": ["NCT00000001"], "term": ["NCT00000001"]}
+        )
+        self.destination = Path(self.temp.name).resolve() / "duplicate-page"
+
+        def duplicate(command, **kwargs):
+            completed = self.fake_bridge(command, **kwargs)
+            save(self.destination / "raw/condition/count.json", {"totalCount": 2})
+            save(
+                self.destination / "raw/condition/page.json",
+                {"totalCount": 2, "studies": [study()], "nextPageToken": "two"},
+            )
+            save(
+                self.destination / "raw/condition/page-two.json", {"studies": [study()]}
+            )
+            path = self.destination / "bridge_manifest.json"
+            manifest = json.loads(path.read_text())
+            manifest["queries"][0]["raw_pages"].append("raw/condition/page-two.json")
+            save(path, manifest)
+            return completed
+
+        with patch.object(r.subprocess, "run", side_effect=duplicate):
+            with self.assertRaisesRegex(
+                r.ValidationError, "within one paginated query"
+            ):
                 r.retrieve_ctrdata(QUERIES, self.destination)
 
     def test_adapter_valid_empty_does_not_require_raw_pages(self):

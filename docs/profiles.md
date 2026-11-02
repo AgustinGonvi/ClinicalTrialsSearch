@@ -57,6 +57,8 @@ The run controller adds an intervention alias query from the union of `selection
 
 `expected.trial_ids`, `exclude_ids`, phrases, and external-agent labels do not broaden retrieval. Put other necessary discovery terms in `queries`.
 
+Generated alias and inclusion-ID queries currently use a single URL each. Large lists can exceed a client or server URL limit; automatic batching is not implemented. Split a large fixed cohort into several explicit named identifier queries rather than placing thousands of IDs in `include_ids`. Keep the selection default appropriate for those queries. A length error fails retrieval visibly; the tool does not silently truncate the list.
+
 ## Importing human review
 
 Create a CSV with this header:

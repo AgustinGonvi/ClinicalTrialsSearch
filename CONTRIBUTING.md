@@ -9,6 +9,8 @@ python -m pip install -e .
 python -m unittest discover -s tests
 ```
 
+When changing the R Retry-After parser, also run `Rscript --vanilla tests/test_retry_after.R` from the checkout. This offline check exercises the actual helper and verifies locale restoration. It reports unavailable non-English locales as skipped; confirm at least one non-English case on a machine with those locales installed.
+
 Include a synthetic regression case for changes to retrieval completeness, selection, missingness, or AE semantics. Test the failure that motivated the change. Preserve unknown values, original source records, separate arms, and separate serious/nonserious event categories.
 
 Do not commit downloaded trial records, local configuration, credentials, databases, logs, reviewer details, or machine-specific paths. Fixtures should be synthetic and contain no personal data. Run outputs belong outside the checkout. Check the staged diff before committing; ignore rules are a guardrail, not a content audit.

@@ -47,6 +47,8 @@ The R bridge uses structured records exported from its database. It does not use
 
 Automatic fallback never combines a failed attempt's pages with the alternate attempt's records. A successful empty query is not a transport failure. Invalid queries, inconsistent evidence, source-version changes, and rate limiting do not justify switching clients to seek a different result. Bounded native retries handle eligible transient errors before fallback is considered.
 
+Interrupted SSL reads are treated as transport errors; certificate-verification failures and local artifact-write failures do not trigger retries or fallback. Malformed R bridge output is recorded as a failed attempt, with its existing raw artifacts retained. The R bridge parses HTTP-date Retry-After headers in the C time locale and restores the previous locale afterward.
+
 Both clients share the upstream source. Neither adds Chinese registrations, European safety notices, sponsor causality assessments, or other material absent from the submitted ClinicalTrials.gov records. Although `ctrdata` itself supports multiple registries, this integration supports only `CTGOV2`; [its broader registry support](https://rfhb.github.io/ctrdata/) should not be confused with this project's scope.
 
 ## Proving equivalence

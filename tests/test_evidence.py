@@ -109,6 +109,21 @@ def run(record, config=None, reviews=None, discovered=True):
 
 
 class SelectionTests(unittest.TestCase):
+    def test_query_membership_keeps_overlapping_queries_sorted_and_distinct(self):
+        records = {"NCT00000001": study(), "NCT00000002": study("NCT00000002")}
+        queries = {
+            "zeta": ["NCT00000002", "NCT00000001"],
+            "alpha": ["NCT00000001"],
+            "empty": [],
+        }
+        output = analyze(records, profile(), queries)
+        memberships = {
+            row["NCTId"]: json.loads(row["query_names"]) for row in output["decisions"]
+        }
+        self.assertEqual(
+            memberships, {"NCT00000001": ["alpha", "zeta"], "NCT00000002": ["zeta"]}
+        )
+
     def test_default_general_search_includes_query_matches_without_human_claim(self):
         output = run(study())
         self.assertEqual(output["decisions"][0]["selection"], "include")
@@ -246,6 +261,59 @@ class SelectionTests(unittest.TestCase):
 
 
 class ExtractionTests(unittest.TestCase):
+    def test_pyelonephritis_uses_infection_soc_without_capturing_other_nephritis(self):
+        for term in ("Pyelonephritis", "Pyelonephritis acute", "PYELONEPHRITIS"):
+            with self.subTest(term=term):
+                self.assertEqual(
+                    renal_category(term, "Infections and infestations"),
+                    "urinary_infection",
+                )
+                self.assertEqual(
+                    renal_category(term, "Renal and urinary disorders"),
+                    "other_renal_or_urinary",
+                )
+                self.assertIsNone(renal_category(term, None))
+        for term in ("Nephritis", "Glomerulonephritis", "Tubulointerstitial nephritis"):
+            with self.subTest(term=term):
+                self.assertEqual(
+                    renal_category(term, "Renal and urinary disorders"),
+                    "kidney_diagnosis",
+                )
+
+    def test_pyelonephritis_category_change_preserves_rows_counts_and_source(self):
+        for soc, expected in (
+            ("Infections and infestations", "urinary_infection"),
+            ("Renal and urinary disorders", "other_renal_or_urinary"),
+            (None, None),
+        ):
+            with self.subTest(soc=soc):
+                record = result_study()
+                event = record["resultsSection"]["adverseEventsModule"][
+                    "seriousEvents"
+                ][0]
+                event.update(term="Pyelonephritis", organSystem=soc)
+                before = copy.deepcopy(record)
+                output = run(record)
+                rows = [
+                    row
+                    for row in output["adverse_events"]
+                    if row["term"] == "Pyelonephritis"
+                ]
+                self.assertEqual(len(rows), 2)
+                self.assertTrue(all(row["classification"] == expected for row in rows))
+                self.assertEqual(
+                    [(row["num_affected"], row["num_at_risk"]) for row in rows],
+                    [(1, 8), (0, 7)],
+                )
+                self.assertEqual(
+                    sum(
+                        row["term"] == "Pyelonephritis"
+                        for row in output["renal_events"]
+                    ),
+                    2 if expected else 0,
+                )
+                self.assertEqual(record, before)
+
     def test_all_events_preserve_arms_seriousness_and_null_zero(self):
         output = run(result_study())
         self.assertEqual(len(output["adverse_events"]), 4)

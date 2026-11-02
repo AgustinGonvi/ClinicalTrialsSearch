@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import re
+import ssl
 import subprocess
 import time
 import urllib.error
@@ -159,7 +160,7 @@ def _count(value):
     return value
 
 
-def _page(page, expected, ids, tokens, records):
+def _page(page, expected, ids, seen_ids, tokens, records):
     if not isinstance(page, dict) or not isinstance(page.get("studies"), list):
         raise ValidationError("Registry page must contain a studies array.")
     if expected is None:
@@ -172,9 +173,10 @@ def _page(page, expected, ids, tokens, records):
         raise ValidationError("Registry totalCount changed during pagination.")
     for record in page["studies"]:
         nct = _merge(records, record)
-        if nct in ids:
+        if nct in seen_ids:
             raise ValidationError(f"Duplicate {nct} within one paginated query.")
         ids.append(nct)
+        seen_ids.add(nct)
     if len(ids) > expected:
         raise ValidationError("Retrieved more unique records than totalCount.")
     token = page.get("nextPageToken")
@@ -214,6 +216,18 @@ def _delay(headers, attempt):
     return max(0.0, seconds)
 
 
+def _request_artifact(path, value, *, binary=False):
+    """Disk failures cannot justify retrying or switching retrieval clients."""
+    try:
+        if binary:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(value)
+        else:
+            _write(path, value)
+    except OSError as exc:
+        raise RetrievalError(f"Local I/O failure: {exc}", retryable=False) from exc
+
+
 def _request_json(url, raw_path, *, timeout, retries):
     """Retries means additional attempts; HTTP 429 can never trigger fallback."""
     saw_rate_limit = False
@@ -228,27 +242,22 @@ def _request_json(url, raw_path, *, timeout, retries):
             )
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = response.read()
-            raw_path.parent.mkdir(parents=True, exist_ok=True)
-            raw_path.write_bytes(body)
-            try:
-                value = json.loads(body)
-            except (UnicodeError, ValueError) as exc:
-                raise ValidationError(
-                    f"Invalid registry JSON in {raw_path.name}."
-                ) from exc
-            return value
         except urllib.error.HTTPError as exc:
             saw_rate_limit |= exc.code == 429
             retry = exc.code == 429 or 500 <= exc.code <= 599
             artifact = (
                 raw_path.parent / "failed_attempts" / f"{raw_path.stem}_{attempt + 1}"
             )
-            artifact.parent.mkdir(parents=True, exist_ok=True)
-            artifact.with_suffix(".body").write_bytes(exc.read())
-            _write(
-                artifact.with_suffix(".json"),
-                {"url": url, "status": exc.code, "attempt": attempt + 1},
-            )
+            failure = {"url": url, "status": exc.code, "attempt": attempt + 1}
+            try:
+                error_body = exc.read()
+            except (http.client.IncompleteRead, OSError) as read_error:
+                error_body = getattr(read_error, "partial", b"")
+                failure["body_read_error"] = str(read_error)
+                if isinstance(read_error, ssl.SSLCertVerificationError):
+                    retry = False
+            _request_artifact(artifact.with_suffix(".body"), error_body, binary=True)
+            _request_artifact(artifact.with_suffix(".json"), failure)
             if not retry or attempt == retries:
                 raise RetrievalError(
                     f"Registry HTTP {exc.code}; inspect saved attempt artifacts.",
@@ -259,9 +268,10 @@ def _request_json(url, raw_path, *, timeout, retries):
             artifact = (
                 raw_path.parent / "failed_attempts" / f"{raw_path.stem}_{attempt + 1}"
             )
-            artifact.parent.mkdir(parents=True, exist_ok=True)
-            artifact.with_suffix(".partial").write_bytes(exc.partial)
-            _write(
+            _request_artifact(
+                artifact.with_suffix(".partial"), exc.partial, binary=True
+            )
+            _request_artifact(
                 artifact.with_suffix(".json"),
                 {
                     "url": url,
@@ -277,24 +287,36 @@ def _request_json(url, raw_path, *, timeout, retries):
                 ) from exc
             time.sleep(min(8, 2**attempt))
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
-            # Filesystem failures are not a reason to switch network backends.
-            if isinstance(exc, OSError) and not isinstance(
-                exc, (urllib.error.URLError, TimeoutError, ConnectionError)
-            ):
-                raise RetrievalError(
-                    f"Local I/O failure: {exc}", retryable=False
-                ) from exc
+            # Only network operations are inside this try block. SSL read errors
+            # are transport failures; certificate verification stays fail-closed.
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            verification_failed = isinstance(reason, ssl.SSLCertVerificationError)
             artifact = (
                 raw_path.parent
                 / "failed_attempts"
                 / f"{raw_path.stem}_{attempt + 1}.json"
             )
-            _write(artifact, {"url": url, "error": str(exc), "attempt": attempt + 1})
+            _request_artifact(
+                artifact, {"url": url, "error": str(exc), "attempt": attempt + 1}
+            )
+            if verification_failed:
+                raise RetrievalError(
+                    f"Registry TLS certificate verification failed: {exc}",
+                    retryable=False,
+                ) from exc
             if attempt == retries:
                 raise RetrievalError(
                     f"Registry network failure: {exc}", retryable=not saw_rate_limit
                 ) from exc
             time.sleep(min(8, 2**attempt))
+        else:
+            _request_artifact(raw_path, body, binary=True)
+            try:
+                return json.loads(body)
+            except (UnicodeError, ValueError) as exc:
+                raise ValidationError(
+                    f"Invalid registry JSON in {raw_path.name}."
+                ) from exc
 
 
 def _finish(destination, metadata, records, query_ids, before, after, backend):
@@ -334,7 +356,8 @@ def retrieve_native(queries, destination, *, timeout=60, retries=3):
         )
         metadata["source_version_before"] = before
         for query in queries:
-            ids, tokens, expected, token, number = [], set(), None, None, 0
+            ids, seen_ids, tokens = [], set(), set()
+            expected, token, number = None, None, 0
             pages = []
             while True:
                 number += 1
@@ -351,7 +374,7 @@ def retrieve_native(queries, destination, *, timeout=60, retries=3):
                     retries=retries,
                 )
                 pages.append(str(raw.relative_to(destination)))
-                expected, token = _page(page, expected, ids, tokens, records)
+                expected, token = _page(page, expected, ids, seen_ids, tokens, records)
                 if not token:
                     break
             query_ids[query["name"]] = ids
@@ -392,6 +415,73 @@ def _ctrdata_query(params):
         {key.removeprefix("query."): value for key, value in params.items()},
         quote_via=urllib.parse.quote,
     )
+
+
+def _bridge_path(destination, value, label):
+    """Validate artifact references before consuming the bridge's JSON output."""
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or any(ord(c) < 32 for c in value)
+    ):
+        raise ValidationError(
+            f"Malformed ctrdata output: {label} must be a relative file name."
+        )
+    relative = Path(value)
+    if relative.is_absolute() or relative.drive or ".." in relative.parts:
+        raise ValidationError(
+            f"Malformed ctrdata output: {label} must stay inside its attempt."
+        )
+    try:
+        path = (destination / relative).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValidationError(
+            f"Malformed ctrdata output: cannot resolve {label} inside its attempt."
+        ) from exc
+    if destination not in path.parents:
+        raise ValidationError(
+            f"Malformed ctrdata output: {label} must stay inside its attempt."
+        )
+    return path
+
+
+def _bridge_manifest(destination, queries):
+    manifest = _read(destination / "bridge_manifest.json")
+    if not isinstance(manifest, dict):
+        raise ValidationError(
+            "Malformed ctrdata output: bridge manifest must be an object."
+        )
+    for field in ("ctrdata_version", "r_version"):
+        if not isinstance(manifest.get(field), str) or not manifest[field]:
+            raise ValidationError(
+                f"Malformed ctrdata output: {field} must be a nonempty string."
+            )
+    reports = manifest.get("queries")
+    if not isinstance(reports, list) or any(
+        not isinstance(item, dict) for item in reports
+    ):
+        raise ValidationError(
+            "Malformed ctrdata output: queries must be an array of objects."
+        )
+    if [report.get("name") for report in reports] != [
+        query["name"] for query in queries
+    ]:
+        raise ValidationError("ctrdata bridge returned a different query plan.")
+    for report, query in zip(reports, queries):
+        if report.get("queryterm") != _ctrdata_query(query["params"]):
+            raise ValidationError(
+                "ctrdata bridge returned a different query expression."
+            )
+        for field in ("count_file", "records_file"):
+            _bridge_path(destination, report.get(field), field)
+        pages = report.get("raw_pages")
+        if not isinstance(pages, list):
+            raise ValidationError(
+                "Malformed ctrdata output: raw_pages must be an array."
+            )
+        for relative in pages:
+            _bridge_path(destination, relative, "raw_pages entry")
+    return manifest
 
 
 def retrieve_ctrdata(
@@ -461,11 +551,18 @@ def retrieve_ctrdata(
                     "retryable": False,
                 }
             )
+            if not isinstance(error, dict) or not isinstance(error.get("message"), str):
+                raise ValidationError(
+                    "Malformed ctrdata output: error report requires a message string."
+                )
+            if not isinstance(error.get("retryable", False), bool):
+                raise ValidationError(
+                    "Malformed ctrdata output: retryable must be a boolean."
+                )
             raise RetrievalError(
-                error.get("message", "ctrdata process failed"),
-                retryable=bool(error.get("retryable", False)),
+                error["message"], retryable=error.get("retryable", False)
             )
-        bridge_manifest = _read(destination / "bridge_manifest.json")
+        bridge_manifest = _bridge_manifest(destination, queries)
         before = _version(_read(destination / "version_before.json"))
         after = _version(_read(destination / "version_after.json"))
         metadata.update(
@@ -475,31 +572,37 @@ def retrieve_ctrdata(
             r_version=bridge_manifest.get("r_version"),
         )
         records, query_ids, import_metadata = {}, {}, {}
-        manifests = bridge_manifest.get("queries")
-        if not isinstance(manifests, list) or [
-            item.get("name") for item in manifests
-        ] != [query["name"] for query in queries]:
-            raise ValidationError("ctrdata bridge returned a different query plan.")
+        manifests = bridge_manifest["queries"]
         for query, report in zip(queries, manifests):
-            count_page = _read(destination / report["count_file"])
+            count_page = _read(
+                _bridge_path(destination, report["count_file"], "count_file")
+            )
+            if not isinstance(count_page, dict):
+                raise ValidationError(
+                    "Malformed ctrdata output: count response must be an object."
+                )
             expected = _count(count_page.get("totalCount"))
-            raw_records, ids, tokens = {}, [], set()
-            raw_pages = report.get("raw_pages", [])
+            raw_records, ids, seen_ids, tokens = {}, [], set(), set()
+            raw_pages = report["raw_pages"]
             if expected and not raw_pages:
                 raise ValidationError(
                     "ctrdata returned no raw pages for a nonempty query."
                 )
             last_token = None
             for index, relative in enumerate(raw_pages):
-                page = _read(destination / relative)
-                _, last_token = _page(page, expected, ids, tokens, raw_records)
+                page = _read(_bridge_path(destination, relative, "raw_pages entry"))
+                _, last_token = _page(
+                    page, expected, ids, seen_ids, tokens, raw_records
+                )
                 if index < len(raw_pages) - 1 and not last_token:
                     raise ValidationError(
                         "ctrdata has extra pages after the final pagination token."
                     )
             if last_token or len(ids) != expected:
                 raise ValidationError("ctrdata raw pages are incomplete.")
-            exported = _read(destination / report["records_file"])
+            exported = _read(
+                _bridge_path(destination, report["records_file"], "records_file")
+            )
             if not isinstance(exported, list):
                 raise ValidationError(
                     "ctrdata record export must be an array, not a flattened data frame."

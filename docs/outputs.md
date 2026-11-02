@@ -35,6 +35,10 @@ The registry's [results data structure](https://clinicaltrials.gov/data-api/abou
 
 The renal view uses deterministic term and organ-system rules. Its categories distinguish kidney diagnoses, kidney laboratory terms, urinary markers, urinary infections, and other renal or urinary entries. Matching avoids common adrenal and gallbladder false positives.
 
+Pyelonephritis uses the reported organ system: `Infections and infestations` maps to `urinary_infection`, while `Renal and urinary disorders` maps to `other_renal_or_urinary`. With another or missing organ system, that term alone receives no renal category. It remains in the full AE export. Other nephritis terms, including glomerulonephritis and tubulointerstitial nephritis, map to `kidney_diagnosis`.
+
+The current collision guard excludes terms containing the whole words `adrenal` or `gallbladder` from the renal subset before applying other rules. This can miss composite terms that also describe a kidney event; inspect the full AE table when those terms are relevant. A reported organ system alone does not override this guard.
+
 This is a screening aid rather than a validated clinical adjudication. Urinary infections are not equivalent to nephrotoxicity; laboratory terms are not equivalent to a diagnosis; terms outside the dictionary may be missed. The full AE export and raw record remain available for review.
 
 ## Comparison
