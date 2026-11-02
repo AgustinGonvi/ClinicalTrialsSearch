@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "name": "kidney-ckd",
+  "description": "A broad condition-field starting search for chronic kidney disease. Investigators must define synonyms, eligibility criteria, and additional sources for a systematic review.",
+  "queries": [
+    {
+      "name": "chronic-kidney-disease",
+      "params": {
+        "query.cond": "chronic kidney disease"
+      }
+    }
+  ],
+  "selection": {
+    "include_ids": [],
+    "exclude_ids": [],
+    "aliases": [],
+    "exclude_aliases": [],
+    "phrases": [],
+    "default": "review"
+  },
+  "expected": {
+    "aliases": [],
+    "trial_ids": [],
+    "external_agents": []
+  }
+}

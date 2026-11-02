@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "name": "kidney-small",
+  "description": "A bounded demonstration using two kidney studies: one with posted results and one without. This fixed cohort is not a comprehensive kidney search.",
+  "queries": [
+    {
+      "name": "kidney-example-records",
+      "params": {
+        "query.term": "AREA[NCTId](NCT00304148 OR NCT03036150)"
+      }
+    }
+  ],
+  "selection": {
+    "include_ids": [],
+    "exclude_ids": [],
+    "aliases": [],
+    "exclude_aliases": [],
+    "phrases": [],
+    "default": "include"
+  },
+  "expected": {
+    "aliases": [],
+    "trial_ids": ["NCT03036150", "NCT00304148"],
+    "external_agents": []
+  }
+}

@@ -1,0 +1,51 @@
+# Python build and environment artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+
+# Local configuration and editor state
+.env
+.env.*
+*.local.json
+*settings.json
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Research outputs must live outside the repository
+/runs/
+/output/
+/outputs/
+/data/
+/records/
+/downloads/
+/work/
+/tmp/
+/cache/
+.cache/
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Optional R runtime state and libraries
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+/r-library/
+/renv/library/

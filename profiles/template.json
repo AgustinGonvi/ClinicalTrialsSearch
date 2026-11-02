@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "name": "new-investigation",
+  "description": "Copy this profile, replace the condition query, and document the intended scope before running it.",
+  "queries": [
+    {
+      "name": "condition-search",
+      "params": {
+        "query.cond": "kidney disease"
+      }
+    }
+  ],
+  "selection": {
+    "include_ids": [],
+    "exclude_ids": [],
+    "aliases": [],
+    "exclude_aliases": [],
+    "phrases": [],
+    "default": "review"
+  },
+  "expected": {
+    "aliases": [],
+    "trial_ids": [],
+    "external_agents": []
+  }
+}

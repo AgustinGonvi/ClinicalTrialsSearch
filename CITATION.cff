@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "Please cite this software and separately cite the registry records used in your analysis."
+type: software
+title: ClinicalTrialsSearch
+abstract: "A reusable ClinicalTrials.gov search and evidence pipeline with kidney examples and source-preserving adverse-event extraction."
+authors:
+  - name: ClinicalTrialsSearch contributors
+license: MIT
+keywords:
+  - clinical trials
+  - reproducibility
+  - kidney
+  - adverse events
