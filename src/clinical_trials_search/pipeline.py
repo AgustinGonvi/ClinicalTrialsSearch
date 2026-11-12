@@ -7,6 +7,7 @@ import datetime as dt
 import hashlib
 import json
 import platform
+import re
 from pathlib import Path
 
 from . import __version__
@@ -22,12 +23,41 @@ class RunFailed(RuntimeError):
         self.path = path
 
 
-def write_json(path: Path, value) -> None:
+def write_text(path: Path, text: str) -> None:
+    """LF on every platform: equal content must hash equally across systems."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
-        encoding="utf-8",
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def write_json(path: Path, value) -> None:
+    write_text(
+        path, json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
     )
+
+
+def write_evidence(path: Path, analysis: dict) -> None:
+    """Stream the analysis with one table row per line.
+
+    A single dumps call holds a large search's whole file in memory twice.
+    """
+
+    def encode(value) -> str:
+        return json.dumps(value, ensure_ascii=False, allow_nan=False)
+
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write("{\n")
+        for position, (key, value) in enumerate(analysis.items()):
+            stream.write(f"  {encode(key)}: ")
+            if isinstance(value, list) and value:
+                stream.write("[\n")
+                for index, row in enumerate(value):
+                    comma = "," if index < len(value) - 1 else ""
+                    stream.write(f"    {encode(row)}{comma}\n")
+                stream.write("  ]")
+            else:
+                stream.write(encode(value))
+            stream.write(",\n" if position < len(analysis) - 1 else "\n")
+        stream.write("}\n")
 
 
 def digest(path: Path) -> str:
@@ -118,6 +148,45 @@ def load_snapshot(path: Path | str) -> tuple[dict, dict]:
     return records, manifest
 
 
+def _same_artifact(old_root, old_manifest, new_root, new_manifest, name, key):
+    """Whether two runs used the same profile, query plan, or reviews.
+
+    Equal hashes settle it. Otherwise compare the parsed files, because
+    releases before 0.2 wrote platform line endings, so one profile hashed
+    differently on Windows and Linux. A file that fails its own manifest
+    hash establishes nothing.
+    """
+    if old_manifest.get(key) == new_manifest.get(key):
+        return True
+    try:
+        values = []
+        for root, manifest in ((old_root, old_manifest), (new_root, new_manifest)):
+            path = Path(root) / name
+            if digest(path) != manifest.get(key):
+                return False
+            values.append(json.loads(path.read_text(encoding="utf-8")))
+        return values[0] == values[1]
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def _same_inputs(old_root, old_manifest, new_root, new_manifest) -> dict:
+    result = {
+        label: _same_artifact(
+            old_root, old_manifest, new_root, new_manifest, name, key
+        )
+        for label, name, key in (
+            ("same_profile", "profile.json", "profile_sha256"),
+            ("same_query_plan", "queries.json", "query_plan_sha256"),
+            ("same_reviews", "reviews.json", "reviews_sha256"),
+        )
+    }
+    result["same_software"] = old_manifest.get(
+        "source_fingerprint"
+    ) == new_manifest.get("source_fingerprint")
+    return result
+
+
 def source_fingerprint() -> str:
     root = Path(__file__).parent
     h = hashlib.sha256()
@@ -155,14 +224,25 @@ def _citations(records, decisions, path):
     selected = {row["NCTId"] for row in decisions if row["selection"] != "exclude"}
     lines = []
     for nct in sorted(selected):
-        ident = records[nct]["protocolSection"]["identificationModule"]
+        protocol = records[nct]["protocolSection"]
+        ident = protocol["identificationModule"]
         title = " ".join(
             str(ident.get("officialTitle") or ident.get("briefTitle") or nct).split()
         )
+        lines.extend(["TY  - DATA", f"TI  - {title}"])
+        # The registration date gives reference managers a year to sort and cite.
+        status = protocol.get("statusModule")
+        posted = (status if isinstance(status, dict) else {}).get(
+            "studyFirstPostDateStruct"
+        )
+        date = posted.get("date") if isinstance(posted, dict) else None
+        if isinstance(date, str) and re.fullmatch(r"\d{4}(-\d{2}){0,2}", date):
+            parts = date.split("-")
+            lines.append(f"PY  - {parts[0]}")
+            # RIS dates always carry three slashes: YYYY/MM/DD/other.
+            lines.append("DA  - " + "/".join(parts + [""] * (4 - len(parts))))
         lines.extend(
             [
-                "TY  - DATA",
-                f"TI  - {title}",
                 "DB  - ClinicalTrials.gov",
                 f"AN  - {nct}",
                 f"UR  - https://clinicaltrials.gov/study/{nct}",
@@ -170,7 +250,7 @@ def _citations(records, decisions, path):
                 "",
             ]
         )
-    path.write_text("\n".join(lines), encoding="utf-8")
+    write_text(path, "\n".join(lines))
 
 
 def _report(manifest, analysis):
@@ -230,7 +310,10 @@ def run_search(
     reviews_path=None,
     settings=None,
     retrievers=None,
+    progress=None,
 ):
+    """Run one search. ``progress`` receives short status lines, if given."""
+    say = progress or (lambda message: None)
     profile = load_profile(profile_path)
     name = name or profile["name"]
     if not isinstance(name, str) or not SLUG.fullmatch(name):
@@ -266,6 +349,14 @@ def run_search(
     manifest["query_plan_sha256"] = digest(staging / "queries.json")
     manifest["reviews_sha256"] = digest(staging / "reviews.json")
     write_json(staging / "manifest.json", manifest)
+
+    def mark_failed(reason):
+        manifest.update(status="failed", error=reason)
+        for attempt in manifest["attempts"]:
+            if attempt["status"] == "running":
+                attempt.update(status="failed", error=reason)
+        write_json(staging / "manifest.json", manifest)
+
     try:
         for choice in ["native", "ctrdata"] if backend == "auto" else [backend]:
             destination = staging / "attempts" / choice
@@ -280,6 +371,10 @@ def run_search(
                 if choice == "ctrdata"
                 else {}
             )
+            if progress:
+                kwargs["progress"] = progress
+            noun = "query" if len(queries) == 1 else "queries"
+            say(f"Retrieving {len(queries)} {noun} with the {choice} backend")
             try:
                 bundle = functions[choice](queries, destination, **kwargs)
                 _validate_bundle(bundle, queries)
@@ -292,6 +387,7 @@ def run_search(
                 write_json(staging / "manifest.json", manifest)
                 if backend != "auto" or choice != "native" or not error.retryable:
                     raise
+                say(f"The {choice} attempt failed; restarting the whole query plan")
         else:
             raise RuntimeError("No backend completed")
         unknown_reviews = set(reviews) - set(bundle.records)
@@ -300,7 +396,9 @@ def run_search(
                 "Reviews refer to records absent from this run: "
                 + ", ".join(sorted(unknown_reviews))
             )
+        say(f"Screening {len(bundle.records)} records and extracting adverse events")
         analysis = analyze(bundle.records, profile, bundle.query_ids, reviews=reviews)
+        say("Writing outputs")
         manifest.update(
             backend=bundle.backend,
             registry_version=bundle.version,
@@ -314,7 +412,20 @@ def run_search(
             ("decisions", ("NCTId", "selection", "reason", "reviewed_by_human")),
             (
                 "trials",
-                ("NCTId", "title", "status", "has_results", "ae_state", "selection"),
+                (
+                    "NCTId",
+                    "title",
+                    "status",
+                    "study_type",
+                    "phases",
+                    "enrollment",
+                    "conditions",
+                    "interventions",
+                    "lead_sponsor",
+                    "has_results",
+                    "ae_state",
+                    "selection",
+                ),
             ),
             (
                 "adverse_events",
@@ -322,6 +433,9 @@ def run_search(
                     "NCTId",
                     "selection",
                     "seriousness",
+                    "classification",
+                    "classification_basis",
+                    "classification_match",
                     "term",
                     "num_affected",
                     "num_at_risk",
@@ -336,6 +450,8 @@ def run_search(
                     "selection",
                     "seriousness",
                     "classification",
+                    "classification_basis",
+                    "classification_match",
                     "term",
                     "num_affected",
                     "num_at_risk",
@@ -354,14 +470,7 @@ def run_search(
             manifest["baseline"] = {
                 "run_id": baseline_manifest["run_id"],
                 "manifest_sha256": digest(Path(baseline) / "manifest.json"),
-                "same_profile": baseline_manifest.get("profile_sha256")
-                == manifest["profile_sha256"],
-                "same_query_plan": baseline_manifest.get("query_plan_sha256")
-                == manifest["query_plan_sha256"],
-                "same_reviews": baseline_manifest.get("reviews_sha256")
-                == manifest["reviews_sha256"],
-                "same_software": baseline_manifest.get("source_fingerprint")
-                == manifest["source_fingerprint"],
+                **_same_inputs(baseline, baseline_manifest, staging, manifest),
             }
             if not manifest["baseline"]["same_profile"]:
                 analysis["warnings"].append(
@@ -385,10 +494,8 @@ def run_search(
         }
         manifest["warnings"] = analysis["warnings"]
         manifest["alias_coverage"] = analysis["alias_coverage"]
-        write_json(staging / "evidence.json", analysis)
-        (staging / "report.md").write_text(
-            _report(manifest, analysis), encoding="utf-8"
-        )
+        write_evidence(staging / "evidence.json", analysis)
+        write_text(staging / "report.md", _report(manifest, analysis))
         manifest["files"] = {
             p.relative_to(staging).as_posix(): digest(p)
             for p in sorted(staging.rglob("*"))
@@ -399,12 +506,12 @@ def run_search(
         write_json(staging / "manifest.json", manifest)
         staging.rename(final)
         return final, manifest
+    except KeyboardInterrupt:
+        # Ctrl-C must not leave a snapshot that still claims to be running.
+        mark_failed("Interrupted before completion")
+        raise
     except Exception as error:
-        manifest.update(status="failed", error=f"{type(error).__name__}: {error}")
-        for attempt in manifest["attempts"]:
-            if attempt["status"] == "running":
-                attempt.update(status="failed", error=str(error))
-        write_json(staging / "manifest.json", manifest)
+        mark_failed(f"{type(error).__name__}: {error}")
         raise RunFailed(str(error), staging) from error
 
 
@@ -414,14 +521,7 @@ def compare_runs(old, new, output):
     result = {
         "old_run": old_manifest["run_id"],
         "new_run": new_manifest["run_id"],
-        "same_profile": old_manifest.get("profile_sha256")
-        == new_manifest.get("profile_sha256"),
-        "same_query_plan": old_manifest.get("query_plan_sha256")
-        == new_manifest.get("query_plan_sha256"),
-        "same_reviews": old_manifest.get("reviews_sha256")
-        == new_manifest.get("reviews_sha256"),
-        "same_software": old_manifest.get("source_fingerprint")
-        == new_manifest.get("source_fingerprint"),
+        **_same_inputs(old, old_manifest, new, new_manifest),
         "changes": compare_snapshots(current, baseline),
     }
     target = require_external(output)

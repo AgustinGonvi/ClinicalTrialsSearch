@@ -1,6 +1,7 @@
 """End-to-end guarantees using synthetic records and interchangeable backends."""
 
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -66,7 +67,7 @@ class PipelineTests(unittest.TestCase):
         result.backend = "ctrdata"
         return result
 
-    def fail(self, queries, destination, **kwargs):
+    def failing(self, queries, destination, **kwargs):
         self.calls.append("failed-native")
         (destination / "partial-page.json").write_text("{}", encoding="utf-8")
         raise RetrievalError("synthetic connection failure", retryable=True)
@@ -86,7 +87,7 @@ class PipelineTests(unittest.TestCase):
             self.profile,
             self.root,
             backend="auto",
-            retrievers={"native": self.fail, "ctrdata": self.fallback},
+            retrievers={"native": self.failing, "ctrdata": self.fallback},
         )
         self.assertEqual(self.calls, ["failed-native", "ctrdata"])
         self.assertEqual(manifest["backend"], "ctrdata")
@@ -184,6 +185,119 @@ class PipelineTests(unittest.TestCase):
                 reviews_path=reviews,
                 retrievers={"native": self.native},
             )
+
+    def test_text_outputs_use_lf_and_evidence_round_trips_one_row_per_line(self):
+        path, manifest = run_search(
+            self.profile, self.root, retrievers={"native": self.native}
+        )
+        for name in (
+            "manifest.json",
+            "profile.json",
+            "queries.json",
+            "reviews.json",
+            "query_ids.json",
+            "evidence.json",
+            "records/NCT00000001.json",
+            "report.md",
+            "citations.ris",
+        ):
+            with self.subTest(name=name):
+                self.assertNotIn(b"\r", (path / name).read_bytes())
+        text = (path / "evidence.json").read_text(encoding="utf-8")
+        evidence = json.loads(text)
+        self.assertEqual(evidence["decisions"][0]["NCTId"], "NCT00000001")
+        self.assertEqual(evidence["adverse_events"], [])
+        self.assertEqual(evidence["warnings"], manifest["warnings"])
+        row = next(line for line in text.splitlines() if "NCT00000001" in line)
+        self.assertEqual(json.loads(row.rstrip(",")), evidence["decisions"][0])
+
+    def crlf_snapshot(self, path):
+        """Rewrite a run as releases before 0.2 saved it on Windows."""
+        manifest = json.loads((path / "manifest.json").read_text())
+        for name, key in (
+            ("profile.json", "profile_sha256"),
+            ("queries.json", "query_plan_sha256"),
+            ("reviews.json", "reviews_sha256"),
+        ):
+            data = (path / name).read_bytes().replace(b"\n", b"\r\n")
+            (path / name).write_bytes(data)
+            manifest[key] = manifest["files"][name] = hashlib.sha256(data).hexdigest()
+        (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    def test_same_inputs_are_recognized_across_line_ending_conventions(self):
+        old, _ = run_search(self.profile, self.root, retrievers={"native": self.native})
+        self.crlf_snapshot(old)
+        new, manifest = run_search(
+            self.profile, self.root, baseline=old, retrievers={"native": self.native}
+        )
+        old_manifest = json.loads((old / "manifest.json").read_text())
+        self.assertNotEqual(old_manifest["profile_sha256"], manifest["profile_sha256"])
+        for key in ("same_profile", "same_query_plan", "same_reviews"):
+            with self.subTest(key=key):
+                self.assertTrue(manifest["baseline"][key])
+        self.assertFalse(any("different profile" in w for w in manifest["warnings"]))
+        diff = compare_runs(old, new, self.root / "comparison.json")
+        self.assertTrue(diff["same_profile"] and diff["same_query_plan"])
+        # A profile that no longer matches its own manifest establishes nothing.
+        (old / "profile.json").write_text("{}", encoding="utf-8")
+        diff = compare_runs(old, new, self.root / "tampered.json")
+        self.assertFalse(diff["same_profile"])
+        self.assertTrue(diff["same_query_plan"])
+
+    def test_interrupt_marks_the_partial_snapshot_failed(self):
+        def interrupted(queries, destination, **kwargs):
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_search(self.profile, self.root, retrievers={"native": interrupted})
+        partial = next((self.root / "kidney-test").glob("*.partial"))
+        manifest = json.loads((partial / "manifest.json").read_text())
+        self.assertEqual(manifest["status"], "failed")
+        self.assertIn("Interrupted", manifest["error"])
+        self.assertEqual(manifest["attempts"][0]["status"], "failed")
+
+    def test_progress_is_optional_and_reaches_the_retriever(self):
+        seen = []
+        callback = seen.append
+
+        def native(queries, destination, progress=None):
+            self.assertIs(progress, callback)
+            progress("condition: 1 of 1 records")
+            return self.native(queries, destination)
+
+        run_search(
+            self.profile, self.root, retrievers={"native": native}, progress=callback
+        )
+        self.assertIn("condition: 1 of 1 records", seen)
+        self.assertTrue(any("native backend" in line for line in seen))
+        self.assertTrue(any("Writing outputs" in line for line in seen))
+        # Without a callback the retriever keeps its two-argument contract.
+        def two_arguments(queries, destination):
+            return self.native(queries, destination)
+
+        run_search(self.profile, self.root, retrievers={"native": two_arguments})
+
+    def test_citations_carry_registration_year_only_when_the_record_has_one(self):
+        def dated(queries, destination, **kwargs):
+            result = self.native(queries, destination)
+            status = result.records["NCT00000001"]["protocolSection"]["statusModule"]
+            status["studyFirstPostDateStruct"] = {"date": self.posted}
+            return result
+
+        for self.posted, expected in (
+            ("2019-12-31", ["PY  - 2019", "DA  - 2019/12/31/"]),
+            ("2019-12", ["PY  - 2019", "DA  - 2019/12//"]),
+            ("not a date", []),
+        ):
+            with self.subTest(posted=self.posted):
+                path, _ = run_search(
+                    self.profile, self.root, retrievers={"native": dated}
+                )
+                lines = (path / "citations.ris").read_text().splitlines()
+                self.assertEqual(
+                    [line for line in lines if line[:2] in {"PY", "DA"}], expected
+                )
+                self.assertIn("AN  - NCT00000001", lines)
 
     def test_output_name_cannot_route_into_checkout_under_allowed_parent(self):
         checkout = self.root / "kidney-test"

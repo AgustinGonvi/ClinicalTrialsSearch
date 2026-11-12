@@ -9,7 +9,8 @@ The search engine is general. Kidney examples provide a starting point; other co
 - Retrieves full ClinicalTrials.gov API v2 records through a native Python client or an optional `ctrdata` R adapter.
 - Keeps queries, raw retrieval artifacts, selected records, decisions, and a run manifest together outside the source repository.
 - Separates automatic rules from imported human review decisions.
-- Exports all reported adverse-event rows and a heuristic renal subset, keeping arms, seriousness, denominators, assessments, and source locations separate.
+- Exports all reported adverse-event rows and a heuristic renal subset, keeping arms, seriousness, denominators, assessments, and source locations separate. Each renal label records the rule and term text behind it.
+- Summarizes every trial's design, phase, enrollment, conditions, interventions, sponsor, and dates in one table.
 - Checks expected aliases and trial IDs, and compares records against an explicitly chosen previous run.
 - Can retry an eligible failed native retrieval with `ctrdata` without changing the downstream evidence code.
 
@@ -33,7 +34,13 @@ For a broader starting search:
 cts run --profile profiles/kidney-ckd.json --name ckd --backend native --output-root ../clinical-trials-output
 ```
 
-That profile searches the condition field for chronic kidney disease. A systematic search still needs an investigator-defined strategy, synonyms, eligibility criteria, and coverage checks. The command may retrieve many records.
+That profile searches the condition field for chronic kidney disease. A systematic search still needs an investigator-defined strategy, synonyms, eligibility criteria, and coverage checks. The command retrieves several thousand full records. Check the size of any search first:
+
+```sh
+cts count profiles/kidney-ckd.json
+```
+
+`count` asks the registry how many studies each query matches and saves nothing. A run prints progress lines to standard error and one JSON summary to standard output; add `--quiet` to suppress the progress lines.
 
 ## Keep local settings outside Git
 
@@ -71,7 +78,7 @@ python -m pip install -e .
 python -m unittest discover -s tests
 ```
 
-Tests use synthetic records and mocked retrieval. Live checks require an explicit run and write outside the repository. Continuous integration runs the offline suite on Windows and Linux with Python 3.11, 3.12, and 3.13.
+Tests use synthetic records and mocked retrieval. Live checks require an explicit run and write outside the repository. Continuous integration runs the offline suite on Windows and Linux with Python 3.11 through 3.14.
 
 See [architecture](docs/architecture.md), [contributing](CONTRIBUTING.md), and the [MIT license](LICENSE). There is no web interface, scheduler, or multi-registry integration in this version.
 

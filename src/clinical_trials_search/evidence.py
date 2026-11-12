@@ -87,30 +87,114 @@ def _phrase_hits(record: dict, phrases: list[str]) -> list[str]:
     ]
 
 
+RENAL_ORGAN_SYSTEM = "Renal and urinary disorders"
+INFECTION_ORGAN_SYSTEM = "Infections and infestations"
+
+# "renal" as its own word, optionally with a prefix that still names the kidney.
+# Adrenal, suprarenal, and infrarenal (aortic) terms are deliberately not matched.
+_KIDNEY = r"(?:kidney|(?<![a-z])(?:(?:pre|post|intra|peri)-?)?renal(?![a-z]))"
+# Cholecystitis (gallbladder) and dacryocystitis (tear sac) are not bladder terms.
+_CYSTITIS = r"(?<!chole)(?<!dacryo)cystitis"
+
+_COLLISION = re.compile(r"\badrenal\b|\bgallbladder\b")
+# The rules run in this order; the first match decides the category.
+_TERM_RULES = (
+    (
+        "kidney_laboratory",
+        re.compile(
+            # Creatine (phospho)kinase is a muscle enzyme, sometimes misspelled.
+            r"creatinine(?!\s*(?:phospho)?kinase)"
+            r"|blood urea|urea nitrogen|\bbun\b"
+            r"|glomerular filtration|\bgfr\b"
+            # EGFR alone may name the epidermal growth factor receptor.
+            r"|\begfr\b(?=.*(?:decreas|declin|reduc|low|increas|abnormal))"
+            r"|(?:decreas|declin|reduc|low|increas|abnormal)\w*\s+(?:in\s+)?egfr\b"
+            r"|cystatin"
+            rf"|{_KIDNEY} function test"
+        ),
+    ),
+    (
+        "kidney_diagnosis",
+        re.compile(
+            r"hepatorenal|cardiorenal"
+            # Pyelonephritis is handled as an infection term below.
+            r"|(?<!pyelo)nephritis|nephropathy|nephrotic|(?<![a-z])nephrosis"
+            r"|nephrosclerosis|nephrotoxic|glomerulosclerosis|glomerulopathy"
+            r"|acute kidney|chronic kidney"
+            rf"|{_KIDNEY} (?:failure|impairment|insufficiency|injury|dysfunction)"
+            rf"|{_KIDNEY} (?:disease|infarct)"
+            rf"|end[- ]?stage {_KIDNEY}"
+            r"|tubular (?:necrosis|acidosis|injury|disorder|dysfunction)"
+            r"|(?<![a-z])ura?emi[ac]|azota?emi[ac]"
+            r"|\b(?:aki|ckd|esrd|eskd|esrf)\b"
+        ),
+    ),
+    (
+        "urinary_marker",
+        re.compile(
+            r"proteinuria|albuminuria|ha?ematuria|pyuria|leu[ck]ocyturia"
+            r"|(?:protein|albumin|blood|blood cells?|leu[ck]ocytes?)\s+(?:in\s+)?urine"
+            r"|(?<![a-z])urine\s+(?:protein|albumin)"
+            r"|(?<![a-z])urinary\s+(?:protein|albumin|casts)"
+        ),
+    ),
+)
+_REPLACEMENT_THERAPY = re.compile(
+    # Iridodialysis, cyclodialysis, and retinal dialysis are eye terms.
+    r"(?<!retinal )(?<![a-z])(?:ha?emo)?dialysis"
+    r"|ha?emo(?:dia)?filtration"
+    rf"|{_KIDNEY} replacement"
+    rf"|{_KIDNEY}(?: and \w+)? (?:transplant|allograft|graft)"
+    rf"|transplanted {_KIDNEY}"
+)
+# A term that names the kidney, the urinary tract, or a urinary-tract infection.
+_KIDNEY_OR_URINARY_TRACT = re.compile(
+    rf"{_KIDNEY}"
+    r"|renovascular"
+    # Epinephrine, norepinephrine, and metanephrine are not kidney terms.
+    r"|nephr(?!ine)"
+    r"|glomerul|ureter|(?<![a-z])urethr"
+    r"|(?<!g[au]ll)(?<!g[au]ll[ -])bladder"
+    # Urine as a specimen (drug screens, hormones) is not matched on its own.
+    r"|(?<![a-z])(?:genito-?)?urinary(?![a-z])"
+    r"|(?<![a-z])urinat|micturition|(?<![a-z])urine output"
+    rf"|(?<![a-z])pyel(?:o|itis)|urosepsis|{_CYSTITIS}|bacteriuria|\butis?\b"
+)
+
+
+def renal_classification(
+    term: str | None, organ_system: str | None
+) -> tuple[str | None, str | None, str | None]:
+    """Return the renal category, what it rests on, and the matched term text.
+
+    The basis is ``term``, ``term_and_organ_system``, or ``organ_system``. This
+    is a screening heuristic; all source events are retained separately.
+    """
+    text = (term or "").lower()
+    if _COLLISION.search(text):
+        return None, None, None
+    for category, pattern in _TERM_RULES:
+        match = pattern.search(text)
+        if match:
+            return category, "term", match.group()
+    tract = _KIDNEY_OR_URINARY_TRACT.search(text)
+    # A urinary-tract term is called an infection only when the sponsor filed
+    # it under the infection organ system.
+    if tract and organ_system == INFECTION_ORGAN_SYSTEM:
+        return "urinary_infection", "term_and_organ_system", tract.group()
+    match = _REPLACEMENT_THERAPY.search(text)
+    if match:
+        return "kidney_replacement_therapy", "term", match.group()
+    if organ_system == RENAL_ORGAN_SYSTEM:
+        return "other_renal_or_urinary", "organ_system", None
+    if tract:
+        return "other_renal_or_urinary", "term", tract.group()
+    return None, None, None
+
+
 def renal_category(term: str | None, organ_system: str | None) -> str | None:
     """Heuristic renal subset; all source events are retained separately."""
-    text = (term or "").lower()
-    if re.search(r"\badrenal\b|\bgallbladder\b", text):
-        return None
-    if re.search(r"creatinine|blood urea|glomerular filtration", text):
-        return "kidney_laboratory"
-    # Pyelonephritis follows the SOC-based infection rule below. Other nephritis
-    # terms (including glomerulonephritis) retain the diagnosis classification.
-    if re.search(
-        r"hepatorenal|(?<!pyelo)nephritis|nephropathy|nephrotic|acute kidney|chronic kidney|renal failure|renal impairment|renal infarct",
-        text,
-    ):
-        return "kidney_diagnosis"
-    if re.search(r"proteinuria|albuminuria|haematuria|hematuria", text):
-        return "urinary_marker"
-    if (
-        re.search(r"urinary tract infection|pyelonephritis|urosepsis|cystitis", text)
-        and organ_system == "Infections and infestations"
-    ):
-        return "urinary_infection"
-    if organ_system == "Renal and urinary disorders":
-        return "other_renal_or_urinary"
-    return None
+    return renal_classification(term, organ_system)[0]
 
 
 def _validate_counts(stat: dict, nct: str, source_path: str) -> None:
@@ -177,6 +261,9 @@ def _extract_events(
             if event.get("stats") is not None and not isinstance(event["stats"], list):
                 raise ValueError(f"{nct}: {event_path}.stats must be an array or null")
             stats = _array(event.get("stats"))
+            category, basis, matched = renal_classification(
+                event.get("term"), event.get("organSystem")
+            )
             # A reported term without arm statistics must remain visible.
             for stat_index, stat in enumerate(stats or [None]):
                 if stats and not isinstance(stat, dict):
@@ -200,9 +287,9 @@ def _extract_events(
                     "selection": selection,
                     "reviewed_by_human": reviewed,
                     "seriousness": seriousness,
-                    "classification": renal_category(
-                        event.get("term"), event.get("organSystem")
-                    ),
+                    "classification": category,
+                    "classification_basis": basis,
+                    "classification_match": matched,
                     "term": event.get("term"),
                     "organ_system": event.get("organSystem"),
                     "group_id": group_id,
@@ -226,10 +313,27 @@ def _extract_events(
     return rows
 
 
+def _names(value: Any, key: str | None = None) -> str | None:
+    """A JSON list cell of the source strings; an absent list stays missing."""
+    if not isinstance(value, list):
+        return None
+    items = [_object(item).get(key) if key else item for item in value]
+    return _json([item for item in items if isinstance(item, str)])
+
+
+def _date(status: dict, key: str) -> Any:
+    return _cell(_object(status.get(key)).get("date"))
+
+
 def _trial_summary(nct: str, record: dict, decision: dict, rows: list[dict]) -> dict:
     protocol = _object(record.get("protocolSection"))
     ident = _object(protocol.get("identificationModule"))
     status = _object(protocol.get("statusModule"))
+    design = _object(protocol.get("designModule"))
+    enrollment = _object(design.get("enrollmentInfo"))
+    sponsor = _object(
+        _object(protocol.get("sponsorCollaboratorsModule")).get("leadSponsor")
+    )
     results = record.get("resultsSection")
     results_present = isinstance(results, dict)
     raw_module = _object(results).get("adverseEventsModule")
@@ -255,6 +359,24 @@ def _trial_summary(nct: str, record: dict, decision: dict, rows: list[dict]) -> 
         "NCTId": nct,
         "title": _cell(ident.get("briefTitle")),
         "status": _cell(status.get("overallStatus")),
+        "study_type": _cell(design.get("studyType")),
+        "phases": _names(design.get("phases")),
+        "enrollment": _cell(enrollment.get("count")),
+        "enrollment_type": _cell(enrollment.get("type")),
+        "conditions": _names(
+            _object(protocol.get("conditionsModule")).get("conditions")
+        ),
+        "interventions": _names(
+            _object(protocol.get("armsInterventionsModule")).get("interventions"),
+            "name",
+        ),
+        "lead_sponsor": _cell(sponsor.get("name")),
+        "lead_sponsor_class": _cell(sponsor.get("class")),
+        "start_date": _date(status, "startDateStruct"),
+        "primary_completion_date": _date(status, "primaryCompletionDateStruct"),
+        "completion_date": _date(status, "completionDateStruct"),
+        "first_posted": _date(status, "studyFirstPostDateStruct"),
+        "results_first_posted": _date(status, "resultsFirstPostDateStruct"),
         "has_results": _cell(has_results),
         "selection": decision["selection"],
         "reviewed_by_human": decision["reviewed_by_human"],
@@ -265,9 +387,7 @@ def _trial_summary(nct: str, record: dict, decision: dict, rows: list[dict]) -> 
         "extracted_ae_rows": len(rows),
         "rows_with_unknown_affected": sum(row["num_affected"] is None for row in rows),
         "rows_with_unknown_at_risk": sum(row["num_at_risk"] is None for row in rows),
-        "last_update_posted": _cell(
-            _object(status.get("lastUpdatePostDateStruct")).get("date")
-        ),
+        "last_update_posted": _date(status, "lastUpdatePostDateStruct"),
         "url": f"https://clinicaltrials.gov/study/{nct}",
     }
 

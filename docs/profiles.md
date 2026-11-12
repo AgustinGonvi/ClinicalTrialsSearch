@@ -8,6 +8,16 @@ cts validate-profile profiles/kidney-small.json
 
 Start from `profiles/template.json`. Keep machine configuration in an external settings file; the profile travels with the scientific question.
 
+## Preview the size of a search
+
+`validate-profile` works offline. To see how many studies each query matches today, ask the registry:
+
+```sh
+cts count profiles/kidney-ckd.json
+```
+
+The command sends one small request per query, including the generated alias and inclusion-ID queries, and saves nothing. Totals are per query: overlapping queries retrieve fewer unique records than their sum. Use it while building a strategy and before a broad run that downloads thousands of full records. When the registry rejects a query, the command prints the registry's own explanation.
+
 ## Profile fields
 
 | Field | Meaning |
