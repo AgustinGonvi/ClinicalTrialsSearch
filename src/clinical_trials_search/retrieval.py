@@ -7,6 +7,7 @@ This module never falls back between backends; the caller owns that decision.
 from __future__ import annotations
 
 import datetime as dt
+import gzip
 import http.client
 import json
 import os
@@ -17,9 +18,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+
+from . import __version__
 
 API = "https://clinicaltrials.gov/api/v2"
 NCT = re.compile(r"NCT\d{8}\Z")
@@ -48,7 +52,12 @@ class RetrievalResult:
 
 def _write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    # LF on every platform: equal content must hash equally across systems.
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+        newline="\n",
+    )
 
 
 def _read(path):
@@ -228,26 +237,59 @@ def _request_artifact(path, value, *, binary=False):
         raise RetrievalError(f"Local I/O failure: {exc}", retryable=False) from exc
 
 
-def _request_json(url, raw_path, *, timeout, retries):
-    """Retries means additional attempts; HTTP 429 can never trigger fallback."""
+def _gunzip(body):
+    """An undecodable compressed body is a truncated transfer, not registry data."""
+    try:
+        return gzip.decompress(body)
+    except (OSError, EOFError, zlib.error) as exc:
+        raise http.client.IncompleteRead(body) from exc
+
+
+def _excerpt(body, limit=300):
+    """Registry error text is untrusted: keep one bounded, printable line."""
+    text = body.decode("utf-8", errors="replace")
+    if "<" in text[:200]:
+        return ""
+    text = "".join(c if c.isprintable() else " " for c in text)
+    return " ".join(text.split())[:limit]
+
+
+def _request_json(url, raw_path, *, timeout, retries, label=None):
+    """Retries means additional attempts; HTTP 429 can never trigger fallback.
+
+    Without a raw_path nothing is written; use that only for count previews.
+    """
     saw_rate_limit = False
+    where = f" during {label}" if label else ""
+    saved = "; inspect saved attempt artifacts" if raw_path else ""
+
+    def keep(attempt, suffix, value, *, binary=False):
+        if raw_path is not None:
+            name = f"{raw_path.stem}_{attempt + 1}{suffix}"
+            _request_artifact(
+                raw_path.parent / "failed_attempts" / name, value, binary=binary
+            )
+
     for attempt in range(retries + 1):
         try:
             request = urllib.request.Request(
                 url,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "ClinicalTrialsSearch/0.1",
+                    # Full records compress about eightfold; saved pages stay decoded.
+                    "Accept-Encoding": "gzip",
+                    "User-Agent": f"ClinicalTrialsSearch/{__version__}",
                 },
             )
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = response.read()
+                headers = getattr(response, "headers", None)
+                encoding = headers.get("Content-Encoding") if headers else None
+            if (encoding or "").lower() == "gzip":
+                body = _gunzip(body)
         except urllib.error.HTTPError as exc:
             saw_rate_limit |= exc.code == 429
             retry = exc.code == 429 or 500 <= exc.code <= 599
-            artifact = (
-                raw_path.parent / "failed_attempts" / f"{raw_path.stem}_{attempt + 1}"
-            )
             failure = {"url": url, "status": exc.code, "attempt": attempt + 1}
             try:
                 error_body = exc.read()
@@ -256,23 +298,23 @@ def _request_json(url, raw_path, *, timeout, retries):
                 failure["body_read_error"] = str(read_error)
                 if isinstance(read_error, ssl.SSLCertVerificationError):
                     retry = False
-            _request_artifact(artifact.with_suffix(".body"), error_body, binary=True)
-            _request_artifact(artifact.with_suffix(".json"), failure)
+            keep(attempt, ".body", error_body, binary=True)
+            keep(attempt, ".json", failure)
             if not retry or attempt == retries:
+                # A rejected query usually says why; show that beside the status.
+                detail = _excerpt(error_body) if 400 <= exc.code <= 499 else ""
                 raise RetrievalError(
-                    f"Registry HTTP {exc.code}; inspect saved attempt artifacts.",
+                    f"Registry HTTP {exc.code}{where}"
+                    + (f": {detail}" if detail else "")
+                    + f"{saved}.",
                     retryable=retry and not saw_rate_limit,
                 ) from exc
             time.sleep(_delay(exc.headers, attempt))
         except http.client.IncompleteRead as exc:
-            artifact = (
-                raw_path.parent / "failed_attempts" / f"{raw_path.stem}_{attempt + 1}"
-            )
-            _request_artifact(
-                artifact.with_suffix(".partial"), exc.partial, binary=True
-            )
-            _request_artifact(
-                artifact.with_suffix(".json"),
+            keep(attempt, ".partial", exc.partial, binary=True)
+            keep(
+                attempt,
+                ".json",
                 {
                     "url": url,
                     "error": str(exc),
@@ -282,7 +324,8 @@ def _request_json(url, raw_path, *, timeout, retries):
             )
             if attempt == retries:
                 raise RetrievalError(
-                    "Registry response body was truncated; partial bytes retained.",
+                    f"Registry response body was truncated{where}"
+                    + ("; partial bytes retained." if raw_path else "."),
                     retryable=not saw_rate_limit,
                 ) from exc
             time.sleep(min(8, 2**attempt))
@@ -291,31 +334,31 @@ def _request_json(url, raw_path, *, timeout, retries):
             # are transport failures; certificate verification stays fail-closed.
             reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
             verification_failed = isinstance(reason, ssl.SSLCertVerificationError)
-            artifact = (
-                raw_path.parent
-                / "failed_attempts"
-                / f"{raw_path.stem}_{attempt + 1}.json"
-            )
-            _request_artifact(
-                artifact, {"url": url, "error": str(exc), "attempt": attempt + 1}
+            keep(
+                attempt,
+                ".json",
+                {"url": url, "error": str(exc), "attempt": attempt + 1},
             )
             if verification_failed:
                 raise RetrievalError(
-                    f"Registry TLS certificate verification failed: {exc}",
+                    f"Registry TLS certificate verification failed{where}: {exc}",
                     retryable=False,
                 ) from exc
             if attempt == retries:
                 raise RetrievalError(
-                    f"Registry network failure: {exc}", retryable=not saw_rate_limit
+                    f"Registry network failure{where}: {exc}",
+                    retryable=not saw_rate_limit,
                 ) from exc
             time.sleep(min(8, 2**attempt))
         else:
-            _request_artifact(raw_path, body, binary=True)
+            if raw_path is not None:
+                _request_artifact(raw_path, body, binary=True)
             try:
                 return json.loads(body)
             except (UnicodeError, ValueError) as exc:
                 raise ValidationError(
-                    f"Invalid registry JSON in {raw_path.name}."
+                    f"Invalid registry JSON{where}"
+                    + (f" in {raw_path.name}." if raw_path else ".")
                 ) from exc
 
 
@@ -338,11 +381,60 @@ def _finish(destination, metadata, records, query_ids, before, after, backend):
     return RetrievalResult(records, query_ids, after, backend, metadata)
 
 
-def retrieve_native(queries, destination, *, timeout=60, retries=3):
+def _check_limits(timeout, retries):
     if timeout <= 0 or not isinstance(retries, int) or retries < 0:
         raise ValidationError(
             "timeout must be positive and retries a nonnegative integer."
         )
+
+
+def count_native(queries, *, timeout=60, retries=3):
+    """Ask the registry how many studies each query matches; retrieve nothing.
+
+    Totals are per query. Queries can overlap, so their sum is an upper bound
+    on the union that a run retrieves.
+    """
+    _check_limits(timeout, retries)
+    _validate_queries(queries)
+    version = _version(
+        _request_json(
+            API + "/version",
+            None,
+            timeout=timeout,
+            retries=retries,
+            label="the version check",
+        )
+    )
+    counts = []
+    for query in queries:
+        params = dict(
+            query["params"],
+            pageSize=1,
+            countTotal="true",
+            fields="NCTId",
+            format="json",
+        )
+        page = _request_json(
+            API + "/studies?" + urllib.parse.urlencode(params),
+            None,
+            timeout=timeout,
+            retries=retries,
+            label=f"query {query['name']!r}",
+        )
+        if not isinstance(page, dict):
+            raise ValidationError("Registry count response must be an object.")
+        counts.append(
+            {
+                "name": query["name"],
+                "params": query["params"],
+                "total_count": _count(page.get("totalCount")),
+            }
+        )
+    return {"version": version, "queries": counts}
+
+
+def retrieve_native(queries, destination, *, timeout=60, retries=3, progress=None):
+    _check_limits(timeout, retries)
     destination, metadata = _prepare(queries, destination, "native")
     records, query_ids = {}, {}
     try:
@@ -352,6 +444,7 @@ def retrieve_native(queries, destination, *, timeout=60, retries=3):
                 destination / "version_before.json",
                 timeout=timeout,
                 retries=retries,
+                label="the version check",
             )
         )
         metadata["source_version_before"] = before
@@ -372,9 +465,12 @@ def retrieve_native(queries, destination, *, timeout=60, retries=3):
                     raw,
                     timeout=timeout,
                     retries=retries,
+                    label=f"query {query['name']!r} page {number}",
                 )
                 pages.append(str(raw.relative_to(destination)))
                 expected, token = _page(page, expected, ids, seen_ids, tokens, records)
+                if progress:
+                    progress(f"{query['name']}: {len(ids)} of {expected} records")
                 if not token:
                     break
             query_ids[query["name"]] = ids
@@ -394,6 +490,7 @@ def retrieve_native(queries, destination, *, timeout=60, retries=3):
                 destination / "version_after.json",
                 timeout=timeout,
                 retries=retries,
+                label="the closing version check",
             )
         )
         metadata["source_version_after"] = after
@@ -485,11 +582,19 @@ def _bridge_manifest(destination, queries):
 
 
 def retrieve_ctrdata(
-    queries, destination, *, rscript="Rscript", r_library=None, timeout=900
+    queries,
+    destination,
+    *,
+    rscript="Rscript",
+    r_library=None,
+    timeout=900,
+    progress=None,
 ):
     if timeout <= 0:
         raise ValidationError("timeout must be positive.")
     destination, metadata = _prepare(queries, destination, "ctrdata")
+    if progress:
+        progress(f"running the ctrdata bridge for a plan of {len(queries)}")
     try:
         bridge_queries = [
             {

@@ -13,6 +13,7 @@ from pathlib import Path
 from . import __version__
 from .pipeline import RunFailed, compare_runs, run_search
 from .profiles import load_profile, query_plan
+from .retrieval import RetrievalError, count_native
 from .settings import load_settings, require_external, save_settings
 
 
@@ -53,6 +54,11 @@ def doctor(settings):
     return info
 
 
+def _progress(message):
+    """Status goes to stderr so stdout stays a single JSON document."""
+    print(message, file=sys.stderr, flush=True)
+
+
 def parser():
     result = argparse.ArgumentParser(
         prog="cts",
@@ -64,6 +70,10 @@ def parser():
         "validate-profile", help="Validate rules and display the exact query plan"
     )
     validate.add_argument("profile", type=Path)
+    count = commands.add_parser(
+        "count", help="Ask the registry how many studies each query matches"
+    )
+    count.add_argument("profile", type=Path)
     run = commands.add_parser("run", help="Retrieve and analyze a new dated snapshot")
     run.add_argument("--profile", required=True, type=Path)
     run.add_argument("--name")
@@ -74,6 +84,9 @@ def parser():
     run.add_argument("--baseline", type=Path)
     run.add_argument("--reviews", type=Path)
     run.add_argument("--config", type=Path)
+    run.add_argument(
+        "--quiet", action="store_true", help="Do not print progress lines to stderr"
+    )
     compare = commands.add_parser(
         "compare", help="Compare complete snapshots, checking source-record hashes"
     )
@@ -103,6 +116,24 @@ def main(argv=None):
                         "valid": True,
                         "name": profile["name"],
                         "queries": query_plan(profile),
+                    },
+                    indent=2,
+                )
+            )
+        elif args.command == "count":
+            profile = load_profile(args.profile)
+            result = count_native(query_plan(profile))
+            print(
+                json.dumps(
+                    {
+                        "name": profile["name"],
+                        "registry_version": result["version"],
+                        "queries": result["queries"],
+                        "sum_of_query_totals": sum(
+                            query["total_count"] for query in result["queries"]
+                        ),
+                        "note": "Totals are per query. Overlapping queries retrieve "
+                        "fewer unique records than this sum. Nothing was saved.",
                     },
                     indent=2,
                 )
@@ -147,6 +178,7 @@ def main(argv=None):
                 baseline=args.baseline,
                 reviews_path=args.reviews,
                 settings=settings,
+                progress=None if args.quiet else _progress,
             )
             print(
                 json.dumps(
@@ -167,6 +199,16 @@ def main(argv=None):
             file=sys.stderr,
         )
         return 1
+    except RetrievalError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print(
+            "Interrupted. A run that had started is marked failed in its "
+            ".partial directory.",
+            file=sys.stderr,
+        )
+        return 130
     except (ValueError, OSError, json.JSONDecodeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 2

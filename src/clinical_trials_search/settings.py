@@ -69,5 +69,7 @@ def save_settings(path: str | Path, values: dict) -> Path:
             "Config already exists; edit it explicitly rather than overwriting it"
         )
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(values, indent=2) + "\n", encoding="utf-8")
+    target.write_text(
+        json.dumps(values, indent=2) + "\n", encoding="utf-8", newline="\n"
+    )
     return target

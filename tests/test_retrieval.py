@@ -1,6 +1,7 @@
 """Offline backend contract tests. No R installation or network is required."""
 
 import datetime as dt
+import gzip
 import http.client
 import io
 import json
@@ -413,6 +414,184 @@ class NativeRetrieval(unittest.TestCase):
         with self.assertRaises(r.ValidationError):
             r.retrieve_native(QUERIES, self.destination)
         self.assertEqual(marker.read_text(), "retain")
+
+
+class GzipResponse(io.BytesIO):
+    """A compressed body together with the header that announces it."""
+
+    def __init__(self, value=None, *, data=None):
+        super().__init__(
+            gzip.compress(json.dumps(value).encode()) if data is None else data
+        )
+        self.headers = {"Content-Encoding": "gzip"}
+
+
+def rejection(body, status=400):
+    return urllib.error.HTTPError(
+        "https://example.invalid", status, "Rejected", {}, io.BytesIO(body)
+    )
+
+
+class NativeTransport(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.destination = self.root / "attempt"
+
+    def test_compressed_pages_are_requested_decoded_and_saved_as_json(self):
+        page = {"totalCount": 1, "studies": [study()]}
+        with patch.object(
+            r.urllib.request,
+            "urlopen",
+            side_effect=[response(VERSION), GzipResponse(page), response(VERSION)],
+        ) as get:
+            result = r.retrieve_native(QUERIES, self.destination, retries=0)
+        self.assertEqual(result.records, {"NCT00000001": study()})
+        for call in get.call_args_list:
+            self.assertEqual(call.args[0].get_header("Accept-encoding"), "gzip")
+        saved = self.destination / "raw" / "condition" / "page_000001.json"
+        self.assertEqual(json.loads(saved.read_text()), page)
+
+    def test_undecodable_compressed_body_is_kept_and_retried_as_truncated(self):
+        broken = gzip.compress(json.dumps(VERSION).encode())[:-6]
+        values = [
+            GzipResponse(data=broken),
+            response(VERSION),
+            response({"totalCount": 0, "studies": []}),
+            response(VERSION),
+        ]
+        with (
+            patch.object(r.urllib.request, "urlopen", side_effect=values),
+            patch.object(r.time, "sleep"),
+        ):
+            result = r.retrieve_native(QUERIES, self.destination, retries=1)
+        self.assertEqual(result.metadata["status"], "complete")
+        self.assertEqual(next(self.destination.rglob("*.partial")).read_bytes(), broken)
+        with patch.object(
+            r.urllib.request, "urlopen", side_effect=[GzipResponse(data=b"not gzip")]
+        ):
+            with self.assertRaisesRegex(r.RetrievalError, "truncated") as raised:
+                r.retrieve_native(QUERIES, self.root / "second", retries=0)
+        self.assertTrue(raised.exception.retryable)
+
+    def test_rejected_query_reports_the_registry_reason_and_the_query(self):
+        for index, (body, expected, absent) in enumerate(
+            (
+                (
+                    b"Error parsing query: unknown area `Example`\n",
+                    ": Error parsing query: unknown area `Example`; inspect",
+                    "\n",
+                ),
+                (b"first\x00\x1b line\r\n   second", ": first line second;", "\x1b"),
+                (b"<html><body>Proxy page</body></html>", "page 1; inspect", "Proxy"),
+                (b"x" * 5000, ": " + "x" * 300 + ";", "x" * 301),
+                (b"", "page 1; inspect", ":"),
+            )
+        ):
+            with self.subTest(index=index):
+                with patch.object(
+                    r.urllib.request,
+                    "urlopen",
+                    side_effect=[response(VERSION), rejection(body)],
+                ) as get:
+                    with self.assertRaises(r.RetrievalError) as raised:
+                        r.retrieve_native(QUERIES, self.root / str(index), retries=3)
+                message = str(raised.exception)
+                self.assertIn("HTTP 400 during query 'condition' page 1", message)
+                self.assertIn(expected, message)
+                self.assertNotIn(absent, message)
+                self.assertFalse(raised.exception.retryable)
+                self.assertEqual(get.call_count, 2)
+
+    def test_server_error_text_is_saved_but_not_quoted(self):
+        with patch.object(
+            r.urllib.request,
+            "urlopen",
+            side_effect=[rejection(b"upstream detail", 503)],
+        ):
+            with self.assertRaises(r.RetrievalError) as raised:
+                r.retrieve_native(QUERIES, self.destination, retries=0)
+        self.assertEqual(
+            str(raised.exception),
+            "Registry HTTP 503 during the version check; "
+            "inspect saved attempt artifacts.",
+        )
+        self.assertEqual(
+            next(self.destination.rglob("*.body")).read_bytes(), b"upstream detail"
+        )
+
+    def test_progress_reports_cumulative_records_after_each_page(self):
+        seen = []
+        pages = [
+            {"totalCount": 2, "studies": [study()], "nextPageToken": "two"},
+            {"studies": [study("NCT00000002")]},
+        ]
+        with patch.object(
+            r.urllib.request,
+            "urlopen",
+            side_effect=[response(value) for value in (VERSION, *pages, VERSION)],
+        ):
+            r.retrieve_native(
+                QUERIES, self.destination, retries=0, progress=seen.append
+            )
+        self.assertEqual(
+            seen, ["condition: 1 of 2 records", "condition: 2 of 2 records"]
+        )
+
+    def test_count_preview_reads_totals_and_writes_nothing(self):
+        queries = QUERIES + [{"name": "term", "params": {"query.term": "example"}}]
+        pages = [
+            {"totalCount": 5863, "studies": [study()], "nextPageToken": "more"},
+            {"totalCount": 0, "studies": []},
+        ]
+        with patch.object(
+            r.urllib.request,
+            "urlopen",
+            side_effect=[response(value) for value in (VERSION, *pages)],
+        ) as get:
+            result = r.count_native(queries, retries=0)
+        self.assertEqual(result["version"], VERSION)
+        self.assertEqual(
+            [(query["name"], query["total_count"]) for query in result["queries"]],
+            [("condition", 5863), ("term", 0)],
+        )
+        self.assertEqual(result["queries"][0]["params"], QUERIES[0]["params"])
+        sent = urllib.parse.parse_qs(
+            urllib.parse.urlparse(get.call_args_list[1].args[0].full_url).query
+        )
+        self.assertEqual(
+            (sent["pageSize"], sent["fields"], sent["query.cond"]),
+            (["1"], ["NCTId"], ["example condition"]),
+        )
+        self.assertNotIn("pageToken", sent)
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_count_preview_failures_are_explicit_and_leave_no_files(self):
+        with patch.object(
+            r.urllib.request,
+            "urlopen",
+            side_effect=[response(VERSION), rejection(b"Unknown area name")],
+        ):
+            with self.assertRaises(r.RetrievalError) as raised:
+                r.count_native(QUERIES, retries=0)
+        self.assertEqual(
+            str(raised.exception),
+            "Registry HTTP 400 during query 'condition': Unknown area name.",
+        )
+        for page in ({"studies": []}, {"totalCount": -1}, ["not an object"]):
+            with self.subTest(page=page):
+                with patch.object(
+                    r.urllib.request,
+                    "urlopen",
+                    side_effect=[response(VERSION), response(page)],
+                ):
+                    with self.assertRaises(r.ValidationError):
+                        r.count_native(QUERIES, retries=0)
+        with self.assertRaises(r.ValidationError):
+            r.count_native([], retries=0)
+        self.assertEqual(list(self.root.iterdir()), [])
 
 
 class CtrdataAdapter(unittest.TestCase):

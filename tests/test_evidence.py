@@ -9,7 +9,12 @@ from clinical_trials_search.evidence import (
     analyze,
     compare_snapshots,
     renal_category,
+    renal_classification,
 )
+
+RENAL = "Renal and urinary disorders"
+INFECTION = "Infections and infestations"
+NEOPLASM = "Neoplasms benign, malignant and unspecified (incl cysts and polyps)"
 
 
 def profile(**selection):
@@ -272,7 +277,13 @@ class ExtractionTests(unittest.TestCase):
                     renal_category(term, "Renal and urinary disorders"),
                     "other_renal_or_urinary",
                 )
-                self.assertIsNone(renal_category(term, None))
+                # The term names the kidney whatever organ system was reported;
+                # only the infection label needs the infection organ system.
+                for soc in (None, "General disorders"):
+                    self.assertEqual(
+                        renal_classification(term, soc),
+                        ("other_renal_or_urinary", "term", "pyelo"),
+                    )
         for term in ("Nephritis", "Glomerulonephritis", "Tubulointerstitial nephritis"):
             with self.subTest(term=term):
                 self.assertEqual(
@@ -284,7 +295,7 @@ class ExtractionTests(unittest.TestCase):
         for soc, expected in (
             ("Infections and infestations", "urinary_infection"),
             ("Renal and urinary disorders", "other_renal_or_urinary"),
-            (None, None),
+            (None, "other_renal_or_urinary"),
         ):
             with self.subTest(soc=soc):
                 record = result_study()
@@ -310,7 +321,7 @@ class ExtractionTests(unittest.TestCase):
                         row["term"] == "Pyelonephritis"
                         for row in output["renal_events"]
                     ),
-                    2 if expected else 0,
+                    2,
                 )
                 self.assertEqual(record, before)
 
@@ -457,6 +468,247 @@ class ExtractionTests(unittest.TestCase):
         original = copy.deepcopy(record)
         run(record)
         self.assertEqual(record, original)
+
+    def test_trial_table_carries_design_sponsor_and_dates_without_inventing_any(self):
+        bare = run(study())["trials"][0]
+        for key in (
+            "study_type",
+            "phases",
+            "enrollment",
+            "enrollment_type",
+            "conditions",
+            "lead_sponsor",
+            "lead_sponsor_class",
+            "start_date",
+            "primary_completion_date",
+            "completion_date",
+            "first_posted",
+            "results_first_posted",
+        ):
+            with self.subTest(key=key):
+                self.assertIsNone(bare[key])
+        self.assertEqual(bare["interventions"], '["ABC123"]')
+        record = study(names=["ABC123", "Placebo"])
+        protocol = record["protocolSection"]
+        protocol["designModule"] = {
+            "studyType": "INTERVENTIONAL",
+            "phases": ["PHASE2", "PHASE3"],
+            "enrollmentInfo": {"count": 0, "type": "ACTUAL"},
+        }
+        protocol["conditionsModule"] = {"conditions": ["Synthetic condition"]}
+        protocol["sponsorCollaboratorsModule"] = {
+            "leadSponsor": {"name": "Synthetic sponsor", "class": "OTHER"}
+        }
+        protocol["statusModule"].update(
+            startDateStruct={"date": "2020-01"},
+            primaryCompletionDateStruct={"date": "2021-02-03", "type": "ACTUAL"},
+            studyFirstPostDateStruct={"date": "2019-12-31"},
+        )
+        row = run(record)["trials"][0]
+        self.assertEqual(row["study_type"], "INTERVENTIONAL")
+        self.assertEqual(row["phases"], '["PHASE2","PHASE3"]')
+        # A reported zero enrollment is a value, not a missing one.
+        self.assertEqual((row["enrollment"], row["enrollment_type"]), (0, "ACTUAL"))
+        self.assertEqual(row["conditions"], '["Synthetic condition"]')
+        self.assertEqual(row["interventions"], '["ABC123","Placebo"]')
+        self.assertEqual(
+            (row["lead_sponsor"], row["lead_sponsor_class"]),
+            ("Synthetic sponsor", "OTHER"),
+        )
+        self.assertEqual(
+            (row["start_date"], row["primary_completion_date"], row["first_posted"]),
+            ("2020-01", "2021-02-03", "2019-12-31"),
+        )
+        self.assertIsNone(row["completion_date"])
+
+
+class RenalClassificationTests(unittest.TestCase):
+    """Each case reproduces a mislabel found when auditing live registry terms."""
+
+    def test_gallbladder_tear_sac_and_muscle_enzyme_terms_are_not_renal(self):
+        for term, soc in (
+            ("Cholecystitis infective", INFECTION),
+            ("Emphysematous cholecystitis", INFECTION),
+            ("Dacryocystitis", INFECTION),
+            ("Blood creatinine phosphokinase increased", "Investigations"),
+            ("Creatinine kinase increased", "Investigations"),
+            ("Blood creatine phosphokinase increased", "Investigations"),
+        ):
+            with self.subTest(term=term):
+                self.assertEqual(renal_classification(term, soc), (None, None, None))
+        self.assertEqual(renal_category("Cystitis", INFECTION), "urinary_infection")
+        self.assertEqual(
+            renal_category("Pyelocystitis", INFECTION), "urinary_infection"
+        )
+        self.assertEqual(
+            renal_category("Blood creatinine increased", "Investigations"),
+            "kidney_laboratory",
+        )
+
+    def test_words_that_only_resemble_kidney_terms_stay_unclassified(self):
+        for term, soc in (
+            ("Epinephrine increased", "Investigations"),
+            ("Normetanephrine urine increased", "Investigations"),
+            ("Suprarenal mass", "Endocrine disorders"),
+            ("Infrarenal aortic aneurysm", "Vascular disorders"),
+            ("Gall bladder perforation", "Hepatobiliary disorders"),
+            ("Urine drug screen positive", "Investigations"),
+            ("Pregnancy test urine positive", "Investigations"),
+            ("Retinal dialysis", "Eye disorders"),
+            ("Iridodialysis", "Eye disorders"),
+            ("EGFR gene mutation", "Investigations"),
+            ("Hyperuricaemia", "Metabolism and nutrition disorders"),
+            ("Akinesia", "Nervous system disorders"),
+            ("Bundle branch block", "Cardiac disorders"),
+            ("Transplant rejection", "Immune system disorders"),
+            ("Headache", None),
+        ):
+            with self.subTest(term=term):
+                self.assertIsNone(renal_category(term, soc))
+
+    def test_specific_categories_outrank_the_renal_organ_system_catch_all(self):
+        for term, category in (
+            ("End stage renal disease", "kidney_diagnosis"),
+            ("End-stage kidney disease", "kidney_diagnosis"),
+            ("ESRD", "kidney_diagnosis"),
+            ("AKI", "kidney_diagnosis"),
+            ("Azotaemia", "kidney_diagnosis"),
+            ("Uremia", "kidney_diagnosis"),
+            ("Renal tubular necrosis", "kidney_diagnosis"),
+            ("Focal segmental glomerulosclerosis", "kidney_diagnosis"),
+            ("Nephrosclerosis", "kidney_diagnosis"),
+            ("Renal insufficiency", "kidney_diagnosis"),
+            ("Prerenal failure", "kidney_diagnosis"),
+            ("Leukocyturia", "urinary_marker"),
+            ("Blood in urine", "urinary_marker"),
+            ("Dialysis", "kidney_replacement_therapy"),
+            ("Kidney transplant rejection", "kidney_replacement_therapy"),
+            # Hydronephrosis contains "nephrosis" but is not that diagnosis.
+            ("Hydronephrosis", "other_renal_or_urinary"),
+            ("Nocturia", "other_renal_or_urinary"),
+        ):
+            with self.subTest(term=term):
+                self.assertEqual(renal_category(term, RENAL), category)
+        self.assertEqual(
+            renal_classification("Nocturia", RENAL),
+            ("other_renal_or_urinary", "organ_system", None),
+        )
+
+    def test_kidney_terms_filed_under_other_organ_systems_are_found(self):
+        for term, soc, expected in (
+            ("Cardiorenal syndrome", "Cardiac disorders", "kidney_diagnosis"),
+            (
+                "Haemolytic uraemic syndrome",
+                "Blood and lymphatic system disorders",
+                "kidney_diagnosis",
+            ),
+            ("Cystatin C increased", "Investigations", "kidney_laboratory"),
+            ("eGFR decreased", "Investigations", "kidney_laboratory"),
+            ("BUN increased", "Investigations", "kidney_laboratory"),
+            ("Renal function test abnormal", "Investigations", "kidney_laboratory"),
+            ("Protein urine present", "Investigations", "urinary_marker"),
+            ("White blood cells urine positive", "Investigations", "urinary_marker"),
+            (
+                "Haemodialysis",
+                "Surgical and medical procedures",
+                "kidney_replacement_therapy",
+            ),
+            (
+                "Peritonitis associated to peritoneal dialysis",
+                "Gastrointestinal disorders",
+                "kidney_replacement_therapy",
+            ),
+            (
+                "Complications of transplanted kidney",
+                "Injury, poisoning and procedural complications",
+                "kidney_replacement_therapy",
+            ),
+            ("Renal cell carcinoma", NEOPLASM, "other_renal_or_urinary"),
+            ("Bladder cancer", NEOPLASM, "other_renal_or_urinary"),
+            (
+                "Nephrogenic anaemia",
+                "Blood and lymphatic system disorders",
+                "other_renal_or_urinary",
+            ),
+            (
+                "Perirenal haematoma",
+                "Injury, poisoning and procedural complications",
+                "other_renal_or_urinary",
+            ),
+            ("Urine output decreased", "Investigations", "other_renal_or_urinary"),
+            ("Urinary tract infection", "General disorders", "other_renal_or_urinary"),
+            (
+                "Cystitis radiation",
+                "Injury, poisoning and procedural complications",
+                "other_renal_or_urinary",
+            ),
+        ):
+            with self.subTest(term=term):
+                category, basis, matched = renal_classification(term, soc)
+                self.assertEqual((category, basis), (expected, "term"))
+                self.assertIn(matched, term.lower())
+
+    def test_infection_label_needs_a_urinary_term_and_the_infection_organ_system(self):
+        for term in (
+            "Kidney infection",
+            "Renal abscess",
+            "Pyonephrosis",
+            "Pyelitis",
+            "Urethritis",
+            "Asymptomatic bacteriuria",
+            "Urinary tract yeast infection",
+            "UTI",
+        ):
+            with self.subTest(term=term):
+                category, basis, matched = renal_classification(term, INFECTION)
+                self.assertEqual(
+                    (category, basis), ("urinary_infection", "term_and_organ_system")
+                )
+                self.assertIn(matched, term.lower())
+                self.assertNotEqual(
+                    renal_category(term, "General disorders"), "urinary_infection"
+                )
+        self.assertIsNone(renal_category("Pneumonia", INFECTION))
+        # A named diagnosis keeps its category under the infection organ system.
+        self.assertEqual(
+            renal_category("Nephritis bacterial", INFECTION), "kidney_diagnosis"
+        )
+
+    def test_adrenal_and_gallbladder_guard_still_overrides_the_organ_system(self):
+        for term in ("Adrenal insufficiency", "Gallbladder disorder"):
+            with self.subTest(term=term):
+                self.assertEqual(renal_classification(term, RENAL), (None, None, None))
+
+    def test_basis_and_matched_text_are_exported_on_every_event_row(self):
+        record = result_study()
+        record["resultsSection"]["adverseEventsModule"]["otherEvents"].append(
+            {
+                "term": "Nocturia",
+                "organSystem": RENAL,
+                "stats": [{"groupId": "E1", "numAffected": 1, "numAtRisk": 8}],
+            }
+        )
+        output = run(record)
+        found = {
+            row["term"]: (
+                row["classification"],
+                row["classification_basis"],
+                row["classification_match"],
+            )
+            for row in output["adverse_events"]
+        }
+        self.assertEqual(
+            found,
+            {
+                "Acute kidney injury": ("kidney_diagnosis", "term", "acute kidney"),
+                "Headache": (None, None, None),
+                "Nocturia": ("other_renal_or_urinary", "organ_system", None),
+            },
+        )
+        self.assertEqual(
+            {row["classification_basis"] for row in output["renal_events"]},
+            {"term", "organ_system"},
+        )
 
 
 class ComparisonTests(unittest.TestCase):
